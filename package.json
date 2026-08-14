@@ -1,0 +1,24 @@
+{
+  "name": "dsh-guardian",
+  "version": "0.1.0",
+  "description": "Agent 安全护栏：拦截并审计所有工具调用，命中敏感操作就要求人工确认",
+  "type": "module",
+  "main": "lib/index.js",
+  "keywords": ["dsh-plugin", "dsh", "security", "audit", "agent"],
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT"
+}

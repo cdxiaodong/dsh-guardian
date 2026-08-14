@@ -1,0 +1,4 @@
+# cordis.patch.yml —— 把本插件插入宿主模块树
+plugins:
+  dsh-guardian:
+    $entry: ./lib/index.js
