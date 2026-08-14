@@ -3,13 +3,16 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { DEFAULT_RULES, type Rule } from './rules.js'
-import { scanSecrets } from './secrets.js'
+import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
+import { checkPath } from './path.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
-export { scanSecrets, SECRET_RULES } from './secrets.js'
+export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js'
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
+export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
+export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
 
 export interface AuditEntry {
   ts: string
@@ -53,12 +56,16 @@ export class GuardianService extends Service {
   private rules: Rule[]
   private enableSecret: boolean
   private enableSSRF: boolean
+  private enablePath: boolean
+  private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
     this.rules = [...DEFAULT_RULES, ...(config.rules ?? [])]
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
+    this.enablePath = config.checkPaths ?? true
+    this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -69,6 +76,21 @@ export class GuardianService extends Service {
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
       return this.check(toolName, payload)
     }, true)
+
+    // 独立的路径沙箱校验通道：宿主读写文件前调用
+    // 用法：const v = ctx.bail('guardian/path', targetPath)；v.safe===false 即拦截
+    ctx.on('guardian/path' as any, (target: string) => {
+      return this.checkPathAccess(target)
+    }, true)
+  }
+
+  /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
+  checkPathAccess(target: string) {
+    const verdict = checkPath(target, this.allowedRoots)
+    if (!verdict.safe) {
+      this.audit({ level: 'deny', engine: 'rule', tool: 'fs', ruleId: 'PATH-SANDBOX', reason: verdict.reason, snippet: target.slice(0, 300) })
+    }
+    return verdict
   }
 
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
@@ -154,6 +176,10 @@ export namespace GuardianService {
     scanSecrets?: boolean
     /** 是否启用 SSRF/内网访问扫描（默认 true） */
     scanSSRF?: boolean
+    /** 是否启用路径沙箱校验（默认 true） */
+    checkPaths?: boolean
+    /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
+    allowedRoots?: string[]
   }
 }
 

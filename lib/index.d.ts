@@ -2,8 +2,10 @@ import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
-export { scanSecrets, SECRET_RULES } from './secrets.js';
+export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
+export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
+export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
@@ -43,7 +45,11 @@ export declare class GuardianService extends Service {
     private rules;
     private enableSecret;
     private enableSSRF;
+    private enablePath;
+    private allowedRoots;
     constructor(ctx: Context, config?: GuardianService.Config);
+    /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
+    checkPathAccess(target: string): import("./path.js").PathVerdict;
     /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
     check(toolName: string, payload: unknown): Interception | false;
     /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
@@ -61,6 +67,10 @@ export declare namespace GuardianService {
         scanSecrets?: boolean;
         /** 是否启用 SSRF/内网访问扫描（默认 true） */
         scanSSRF?: boolean;
+        /** 是否启用路径沙箱校验（默认 true） */
+        checkPaths?: boolean;
+        /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
+        allowedRoots?: string[];
     }
 }
 export declare const provide: string[];

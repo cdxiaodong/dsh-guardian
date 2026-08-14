@@ -128,3 +128,41 @@ test('支持运行时加自定义规则', async () => {
   const run = (t, p) => ctx.bail('guardian/check', t, p)
   assert.ok(isBlocked(run('bash', 'danger-cmd --now')))
 })
+
+// ── 引擎 5：路径沙箱（realpath + 白名单）─────────────
+test('路径沙箱：系统目录/凭据目录拦截', async () => {
+  const ctx = makeCtx(); await wait()
+  const g = ctx.guardian
+  assert.equal(g.checkPathAccess('/etc/passwd').safe, false)
+  assert.equal(g.checkPathAccess('/root/.ssh/id_rsa').safe, false)
+  assert.equal(g.checkPathAccess('/home/user/project/src/index.ts').safe, true)
+})
+
+test('路径沙箱：../ 逃逸被 realpath 解析后拦截', async () => {
+  const ctx = makeCtx(); await wait()
+  const g = ctx.guardian
+  // 从 /home/user/project 用 ../../../etc/passwd 逃逸到 /etc
+  assert.equal(g.checkPathAccess('/home/user/project/../../../etc/passwd').safe, false)
+})
+
+test('路径沙箱：白名单根目录约束', async () => {
+  const root = new Context()
+  root.plugin(plugin, { allowedRoots: ['/home/user/workspace'] })
+  await wait()
+  const g = root.guardian
+  assert.equal(g.checkPathAccess('/home/user/workspace/a.ts').safe, true)
+  assert.equal(g.checkPathAccess('/home/user/other/b.ts').safe, false)
+  assert.equal(g.checkPathAccess('/home/user/workspace/../../etc/hosts').safe, false)
+})
+
+test('路径沙箱：空字节截断拦截', async () => {
+  const ctx = makeCtx(); await wait()
+  const g = ctx.guardian
+  assert.equal(g.checkPathAccess('/safe/file.txt%00.jpg').safe, false)
+})
+
+test('guardian/path 事件通道可用', async () => {
+  const ctx = makeCtx(); await wait()
+  const v = ctx.bail('guardian/path', '/etc/shadow')
+  assert.equal(v.safe, false)
+})
