@@ -4,7 +4,13 @@
   "description": "Agent 安全护栏：拦截并审计所有工具调用，命中敏感操作就要求人工确认",
   "type": "module",
   "main": "lib/index.js",
-  "keywords": ["dsh-plugin", "dsh", "security", "audit", "agent"],
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "security",
+    "audit",
+    "agent"
+  ],
   "dsh": {
     "bundle": {
       "patch": "cordis.patch.yml"
@@ -15,9 +21,10 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@deepseek-ai/cordis": "^1.0.0"
+    "cordis": "^4.0.0-rc.8"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
     "typescript": "^5.5.0"
   },
   "license": "MIT"
