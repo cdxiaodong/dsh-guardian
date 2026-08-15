@@ -1,4 +1,5 @@
-# cordis.patch.yml —— 把本插件插入宿主模块树
-plugins:
-  dsh-guardian:
-    $entry: ./lib/index.js
+# cordis.patch.yml —— loader patch：把 dsh-guardian 插入 DSH 宿主插件树
+# 顶层必须是 YAML 数组（loader patch entries），`insert` 为插入的插件条目
+- insert:
+    - id: dsh-guardian
+      name: dsh-guardian
