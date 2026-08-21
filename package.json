@@ -1,6 +1,6 @@
 {
   "name": "dsh-guardian",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Agent 安全护栏：拦截并审计所有工具调用，命中敏感操作就要求人工确认",
   "type": "module",
   "main": "lib/index.js",
@@ -22,7 +22,8 @@
     "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
-    "cordis": "^4.0.0-rc.8"
+    "cordis": "^4.0.0-rc.8",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
