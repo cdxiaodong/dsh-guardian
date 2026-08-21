@@ -15,11 +15,13 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 检测能力
 
-| 引擎 | 检测内容 | 借鉴来源 |
+| 能力 | 检测内容 | 借鉴来源 |
 |---|---|---|
+| **POLICY** YAML 策略引擎 | 工具名通配 + 参数正则 + 优先级 + allow 白名单豁免 + 热加载（改文件即生效，坏配置自动回退） | Edictum（2026 运行时治理库） |
 | **CMD/INJ** 危险命令 | rm -rf、dd、mkfs、fork炸弹、反弹shell、管道执行、提权 | Sigma 规则、PayloadsAllTheThings |
+| **RCE** 反序列化/动态执行 | pickle/marshal/yaml.load、eval/exec 模型输入、child_process、torch.load 恶意模型、new Function | Microsoft《When prompts become shells》(2026-05) |
 | **CRED** 凭据保护 | 读 .ssh/.aws/.env/kubeconfig、/etc/shadow | mcp-safeguard CRED 系列 |
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
@@ -29,6 +31,43 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+
+### 📜 YAML 声明式策略（Policy-as-Code）
+
+策略即数据：不改代码，一个 YAML 文件就能封禁工具、豁免白名单场景、文件保存后自动热加载：
+
+```yaml
+version: 1
+policies:
+  # 封禁整个工具族（* 通配）
+  - id: deny-python-exec
+    tool: python*
+    action: deny
+    reason: 禁用 Python 动态执行工具
+
+  # 高优先级白名单：豁免内置规则（明文密钥扫描除外）
+  - id: allow-docs-cleanup
+    tool: shell
+    match: rm -rf ~/Documents
+    action: allow
+    priority: 1
+
+  # block 级：走 guardian/approve 人工确认
+  - id: block-force-push
+    tool: [git, gh]
+    match: push.*--force
+    action: block
+    reason: 禁止强推远端
+```
+
+```js
+ctx.plugin(guardian, { policyFile: './policy.yaml' })  // 默认开启热加载
+ctx.on('guardian/policy-loaded', (res) => {          // 每次重载广播结果
+  if (!res.ok) console.error('策略回退：', res.errors)
+})
+```
+
+热加载安全原则：解析/校验失败时**保留旧策略**并写审计告警——绝不因配置写错而裸奔。
 
 ## 🚦 三级处置
 
@@ -79,20 +118,23 @@ console.log(ctx.guardian.readAudit(20))
 | Cordis / 时空可组合概念 | 本插件体现 |
 |---|---|
 | 响应式协效应（provide/inject） | `provide=['guardian']` 对外提供服务；依赖 cordis 事件系统 |
-| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
+| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 关文件流；`unwatchFile` 停策略热加载监听——卸载零残留 |
 | 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
-| 隔离机制 | 多实例可绑定独立配置/白名单 |
+| 事件广播（时间维度解耦） | `guardian/policy-loaded` 广播策略热加载结果，宿主无需轮询 |
+| 隔离机制 | 多实例可绑定独立配置/白名单/策略文件 |
 
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 34/34 通过
 ```
 
 ## 🙏 致谢 / 参考
 
-本插件的规则与架构缝合自以下优秀开源方案：
+本插件的规则与架构缝合自以下优秀开源方案与研究成果：
 
+- [Edictum](https://edictum.ai/) — YAML 安全契约 + 运行时工具调用治理思想
+- [Microsoft《When prompts become shells》](https://www.microsoft.com/en-us/security/blog/2026/05/07/prompts-become-shells-rce-vulnerabilities-ai-agent-frameworks/) — 反序列化/动态执行 RCE 规则集来源
 - [gitleaks](https://github.com/gitleaks/gitleaks) — 密钥正则库 + 熵过滤
 - [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) — 密钥检测器设计
 - [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline 架构

@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { parsePolicyYaml, evaluatePolicies, type CompiledPolicy, type PolicyRule, type PolicyLoadResult } from './policy.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { parsePolicyYaml, compilePolicies, evaluatePolicies, globToRegExp, type PolicyRule, type PolicyFile, type PolicyAction, type CompiledPolicy, type PolicyLoadResult } from './policy.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'policy'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,8 +47,9 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
+ * 检测引擎（按顺序）：
+ *  0. policy —— YAML 声明式策略（工具名通配 + 参数正则 + allow 白名单豁免，支持热加载）
+ *  1. rule   —— 危险命令 / 破坏操作 / 提示注入 / RCE 反序列化正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
  */
@@ -58,6 +61,10 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 已编译策略（按 priority 升序），来自 YAML 策略文件 */
+  private policies: CompiledPolicy[] = []
+  private policyPath: string | undefined
+  private unwatchPolicy: (() => void) | undefined
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -69,8 +76,17 @@ export class GuardianService extends Service {
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
-    // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
-    ctx.effect(() => () => this.stream.end())
+    // 可逆效应：插件卸载时自动关闭文件流、停掉策略热加载监听（时空可组合-时间维度）
+    ctx.effect(() => () => {
+      this.stream.end()
+      this.unwatchPolicy?.()
+    })
+
+    // YAML 策略文件：提供即加载，默认开启热加载（fs.watchFile 轮询，跨编辑器保存可靠）
+    if (config.policyFile) {
+      this.loadPolicyFile(config.policyFile)
+      if (config.watchPolicy !== false) this.watchPolicyFile(config.policyFile)
+    }
 
     // 护栏最先执行（prepend）
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
@@ -96,6 +112,30 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：YAML 声明式策略（Edictum 式工具契约，优先于内置规则）
+    if (this.policies.length) {
+      const policy = evaluatePolicies(this.policies, toolName, text)
+      if (policy) {
+        const snippet = text.slice(0, 300)
+        if (policy.action === 'allow') {
+          // 显式白名单：豁免内置规则引擎，但保留密钥扫描（明文凭据任何场景都不该外泄）
+          this.audit({ level: 'allow', engine: 'policy', tool: toolName, ruleId: policy.id, reason: policy.reason ?? '策略白名单放行', snippet })
+          if (this.enableSecret) {
+            const secretHits = scanSecrets(text)
+            if (secretHits.length) {
+              const first = secretHits[0]
+              this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `检测到明文密钥：${first.description}（${first.match}）`, snippet })
+              return { intercepted: true, reason: `检测到明文密钥：${first.description}`, ruleId: first.ruleId, action: 'deny', engine: 'secret' }
+            }
+          }
+          return false
+        }
+        // allow 已在上面单独处理，此处只剩 deny/block/log
+        const hit = this.handleRule(toolName, { id: policy.id, reason: policy.reason ?? `策略 ${policy.id} 命中`, action: policy.action as Rule['action'] }, snippet, 'policy')
+        if (hit) return hit
+      }
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -166,6 +206,45 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 加载 YAML 策略文件（解析+校验+立即生效）。失败保留旧策略并返回 errors——热加载安全回退 */
+  loadPolicyFile(file: string): PolicyLoadResult {
+    this.policyPath = file
+    let text: string
+    try {
+      text = fs.readFileSync(file, 'utf8')
+    } catch (e: any) {
+      this.audit({ level: 'deny', engine: 'policy', reason: `策略文件读取失败：${e.message}，保留当前 ${this.policies.length} 条策略`, ruleId: 'POLICY-LOAD' })
+      return { ok: false, count: this.policies.length, errors: [`读取失败：${e.message}`] }
+    }
+    const { policies, errors } = parsePolicyYaml(text)
+    if (errors.length) {
+      this.audit({ level: 'deny', engine: 'policy', reason: `策略文件校验失败（${errors.length} 处），保留当前 ${this.policies.length} 条旧策略`, ruleId: 'POLICY-LOAD', snippet: errors.join('；').slice(0, 300) })
+      return { ok: false, count: this.policies.length, errors }
+    }
+    this.policies = policies
+    return { ok: true, count: policies.length, errors: [] }
+  }
+
+  /** 重新加载当前策略文件 */
+  reloadPolicy(): PolicyLoadResult {
+    if (!this.policyPath) return { ok: false, count: 0, errors: ['未配置策略文件'] }
+    return this.loadPolicyFile(this.policyPath)
+  }
+
+  /** 当前生效的策略列表（已按 priority 排序） */
+  listPolicies(): PolicyRule[] { return [...this.policies] }
+
+  /** 监听策略文件变化自动热加载；每次重载结果经 'guardian/policy-loaded' 事件广播（时空可组合-空间维度） */
+  private watchPolicyFile(file: string) {
+    const listener = (curr: fs.Stats, prev: fs.Stats) => {
+      if (curr.mtimeMs === prev.mtimeMs) return
+      const result = this.loadPolicyFile(file)
+      this.ctx.emit('guardian/policy-loaded' as any, result)
+    }
+    fs.watchFile(file, { interval: 1000 }, listener)
+    this.unwatchPolicy = () => fs.unwatchFile(file, listener)
+  }
 }
 
 export namespace GuardianService {
@@ -180,6 +259,10 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** YAML 声明式策略文件路径（提供即启用策略引擎，优先于内置规则） */
+    policyFile?: string
+    /** 是否热加载策略文件变化（默认 true；加载失败自动回退旧策略） */
+    watchPolicy?: boolean
   }
 }
 
