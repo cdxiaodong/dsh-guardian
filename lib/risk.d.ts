@@ -1,4 +1,5 @@
 import type { Rule } from './rules.js';
+import { type TransformKind } from './deobfuscate.js';
 /**
  * 风险评分引擎（调研 takeaway：多信号加权 → 阈值分级处置）。
  * 不只会一刀切，把命中的所有信号累加成 0~1 风险分，再按阈值决定动作。
@@ -29,5 +30,9 @@ export declare const DEFAULT_THRESHOLDS: RiskThresholds;
 export declare function scoreSignals(signals: RiskSignal[], thresholds?: RiskThresholds): RiskScore;
 /** 从规则列表收集一次文本命中的所有信号 */
 export declare function collectSignals(rules: Rule[], text: string): RiskSignal[];
+/** 深度信号收集：连同混淆消解变体一起扫，去重后附加混淆意图信号 */
+export declare function collectSignalsDeep(rules: Rule[], text: string): RiskSignal[];
+/** 混淆意图信号：按最危险的变换定权（Tags 隐形指令 > bidi > 零宽 > base64 > leet > 编码类） */
+export declare function obfuscationSignal(transforms: TransformKind[]): RiskSignal | null;
 /** 密钥熵越高越可疑：把熵映射成 0~1 权重信号 */
 export declare function secretEntropySignal(ruleId: string, description: string, raw: string): RiskSignal;

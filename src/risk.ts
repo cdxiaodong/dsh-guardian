@@ -1,5 +1,6 @@
 import type { Rule } from './rules.js'
 import { shannonEntropy } from './secrets.js'
+import { expandTexts, type TransformKind } from './deobfuscate.js'
 
 /**
  * 风险评分引擎（调研 takeaway：多信号加权 → 阈值分级处置）。
@@ -53,6 +54,41 @@ export function collectSignals(rules: Rule[], text: string): RiskSignal[] {
     }
   }
   return signals
+}
+
+/** 深度信号收集：连同混淆消解变体一起扫，去重后附加混淆意图信号 */
+export function collectSignalsDeep(rules: Rule[], text: string): RiskSignal[] {
+  const seen = new Set<string>()
+  const signals: RiskSignal[] = []
+  for (const variant of expandTexts(text)) {
+    for (const s of collectSignals(rules, variant.text)) {
+      if (seen.has(s.ruleId)) continue
+      seen.add(s.ruleId)
+      signals.push(variant.via.length ? { ...s, reason: `混淆变形后命中：${s.reason}` } : s)
+    }
+  }
+  const obf = obfuscationSignal(expandTexts(text).slice(1).flatMap((v) => v.via))
+  if (obf) signals.push(obf)
+  return signals
+}
+
+/** 混淆意图信号：按最危险的变换定权（Tags 隐形指令 > bidi > 零宽 > base64 > leet > 编码类） */
+export function obfuscationSignal(transforms: TransformKind[]): RiskSignal | null {
+  if (!transforms.length) return null
+  const weights: Record<TransformKind, number> = {
+    'tags-block': 0.75, bidi: 0.6, 'zero-width': 0.5, base64: 0.55, leet: 0.3,
+    nfkc: 0.15, 'html-entity': 0.2, percent: 0.2,
+  }
+  const weight = Math.max(...transforms.map((t) => weights[t]))
+  const names: Record<TransformKind, string> = {
+    'tags-block': 'Unicode Tags 隐形指令', bidi: '双向覆盖控制符', 'zero-width': '零宽/填充字符',
+    base64: 'Base64 编码', leet: 'Leetspeak', nfkc: '全角/兼容字符', 'html-entity': 'HTML 实体', percent: '百分号编码',
+  }
+  return {
+    ruleId: 'DEOB-001',
+    reason: `检测到混淆变形：${transforms.map((t) => names[t]).join('、')}`,
+    weight, category: 'obfuscation',
+  }
 }
 
 /** 动作到默认权重的映射（无显式 weight 时用） */
