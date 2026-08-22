@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,11 +24,13 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **DEOB** 混淆消解 | decode-before-scan：Unicode Tags 隐形指令、零宽/双向覆盖字符、全角同形字、HTML 实体、百分号、Base64、leetspeak 解码还原后再扫，全部引擎检出率同步提升 | CSA Research Note 2026、arXiv:2508.14070、WAF 请求归一化 |
 
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **混淆消解引擎**（`deobfuscate.ts`）：归一化折叠 + 变体展开，把藏进编码与隐形字符里的攻击内容拉回可见层；混淆变体命中 log 级规则自动升级人工确认，审计记录完整变换链（`via`）
 
 ## 🚦 三级处置
 

@@ -6,7 +6,7 @@ export interface Rule {
   /** block=需人工确认；deny=直接拒绝；log=仅记录 */
   action: 'block' | 'deny' | 'log'
   /** 规则分类，便于审计与统计 */
-  category?: 'destructive' | 'injection' | 'credential' | 'exfil' | 'network' | 'filesystem' | 'prompt-injection' | 'tool-poisoning' | 'privesc'
+  category?: 'destructive' | 'injection' | 'credential' | 'exfil' | 'network' | 'filesystem' | 'prompt-injection' | 'tool-poisoning' | 'privesc' | 'obfuscation'
   /** 风险权重 0~1，用于多信号加权评分（调研建议） */
   weight?: number
 }
@@ -77,7 +77,7 @@ export const DEFAULT_RULES: Rule[] = [
   { id: 'PI-003', category: 'prompt-injection', weight: 0.8, pattern: /(you\s+are\s+now|act\s+as|pretend\s+(you\s+are|to\s+be)|enable|enter|activate)\s+.?(DAN|do\s+anything\s+now|developer\s+mode|god\s+mode|unrestricted|jailbreak|unfiltered|uncensored)/i, reason: '提示注入：越狱/DAN/角色逃逸', action: 'block' },
   { id: 'PI-004', category: 'prompt-injection', weight: 0.7, pattern: /(reveal|show|print|repeat|output|tell\s+me)\s+(me\s+)?(your\s+)?(system\s+)?(prompt|instructions?|initial\s+message)/i, reason: '提示注入：诱导泄露系统提示', action: 'log' },
   { id: 'PI-005', category: 'prompt-injection', weight: 0.8, pattern: /forget\s+(everything|all\s+(your\s+)?(previous\s+)?instructions?)/i, reason: '提示注入：忘记指令', action: 'block' },
-  { id: 'PI-006', category: 'prompt-injection', weight: 0.7, pattern: /[​‌‍⁠﻿]/, reason: '提示注入：零宽字符/隐写', action: 'log' },
+  { id: 'PI-006', category: 'prompt-injection', weight: 0.7, pattern: /[\u200B\u200C\u200D\u2060\uFEFF\u180E\u3164\uFFA0]/, reason: '提示注入：零宽字符/隐写（混淆消解引擎会进一步解码变形）', action: 'log' },
 
   // ── TP：工具投毒 / 欺骗指令（扫 tool description / 返回内容）──
   { id: 'TP-001', category: 'tool-poisoning', weight: 0.8, pattern: /<!--\s*(ignore|instruction|system|assistant|note\s+to)/i, reason: '工具投毒：HTML 注释藏指令', action: 'block' },

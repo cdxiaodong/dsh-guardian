@@ -6,22 +6,26 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { expandTexts, TRANSFORM_LABELS, type TransformKind } from './deobfuscate.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js'
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
-export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scoreSignals, collectSignals, secretEntropySignal, obfuscationSignal, collectSignalsDeep, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { normalizeText, expandTexts, findBase64Segments, TRANSFORM_LABELS, type TransformKind, type NormalizedText, type TextVariant } from './deobfuscate.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'deob'
   tool?: string
   ruleId?: string
   reason?: string
   snippet?: string
+  /** 命中变体经过的混淆消解变换链（原文直接命中时无此字段） */
+  via?: TransformKind[]
 }
 
 export interface Interception {
@@ -30,6 +34,8 @@ export interface Interception {
   ruleId: string
   action: Rule['action']
   engine: AuditEntry['engine']
+  /** 命中变体经过的混淆消解变换链（原文直接命中时无此字段） */
+  via?: TransformKind[]
 }
 
 declare module 'cordis' {
@@ -45,10 +51,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
- *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ * 检测管线（混淆消解前置）：
+ *  原文/归一化变体 →  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
+ *                      2. secret —— 密钥/凭据泄露（gitleaks 风格）
+ *                      3. ssrf   —— 内网/元数据地址访问
+ *  变体由 deobfuscate 引擎展开：零宽/Unicode Tags/bidi 剥离解码、NFKC、
+ *  HTML 实体/百分号/base64/leetspeak 解码还原（decode-before-scan）。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +65,9 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableDeobfuscation: boolean
+  private escalateObfuscated: boolean
+  private auditObfuscation: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +76,9 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableDeobfuscation = config.deobfuscate ?? true
+    this.escalateObfuscated = config.escalateObfuscated ?? true
+    this.auditObfuscation = config.auditObfuscation ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -95,14 +109,39 @@ export class GuardianService extends Service {
 
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
-    const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+    const raw = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
 
+    // 混淆消解（decode-before-scan）：原文 + 归一化/解码变体依次过引擎。
+    // 原文始终第一（原文命中行为与旧版完全一致），纯净文本仅 1 个变体，零额外开销。
+    const variants = this.enableDeobfuscation
+      ? expandTexts(raw)
+      : [{ text: raw, via: [] as TransformKind[] }]
+
+    for (const variant of variants) {
+      const hit = this.checkText(toolName, variant.text, raw, variant.via)
+      if (hit) return hit
+    }
+
+    // 未命中规则，但检测到了混淆变形 → 记一条审计供事后追溯（不拦截）
+    if (this.enableDeobfuscation && this.auditObfuscation && variants.length > 1) {
+      const via = variants[1].via
+      this.audit({
+        level: 'allow', engine: 'deob', tool: toolName, ruleId: 'DEOB-INFO',
+        reason: `检测到混淆变形（${via.map((t) => TRANSFORM_LABELS[t]).join('→')}），归一化后未命中规则`,
+        snippet: raw.slice(0, 300), via,
+      })
+    }
+    return false
+  }
+
+  /** 对单个文本变体跑全部引擎。via 非空表示这是混淆消解后的变体 */
+  private checkText(toolName: string, text: string, raw: string, via: TransformKind[]): Interception | false {
     // 引擎 1：危险规则
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
       if (!rule.pattern.test(text)) continue
-      const snippet = text.slice(0, 300)
-      const hit = this.handleRule(toolName, rule, snippet, 'rule')
+      const snippet = raw.slice(0, 300)
+      const hit = this.handleRule(toolName, rule, snippet, 'rule', via)
       if (hit) return hit
     }
 
@@ -111,8 +150,8 @@ export class GuardianService extends Service {
       const secretHits = scanSecrets(text)
       if (secretHits.length) {
         const first = secretHits[0]
-        this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `检测到明文密钥：${first.description}（${first.match}）`, snippet: text.slice(0, 300) })
-        return { intercepted: true, reason: `检测到明文密钥：${first.description}`, ruleId: first.ruleId, action: 'deny', engine: 'secret' }
+        this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `检测到明文密钥：${first.description}（${first.match}）`, snippet: raw.slice(0, 300), ...(via.length ? { via } : {}) })
+        return { intercepted: true, reason: `检测到明文密钥：${first.description}${via.length ? '（混淆变形后检出）' : ''}`, ruleId: first.ruleId, action: 'deny', engine: 'secret', ...(via.length ? { via } : {}) }
       }
     }
 
@@ -121,8 +160,8 @@ export class GuardianService extends Service {
       const ssrfHits = scanNetworkTarget(text)
       if (ssrfHits.length) {
         const first = ssrfHits[0]
-        const snippet = text.slice(0, 300)
-        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf')
+        const snippet = raw.slice(0, 300)
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf', via)
         if (hit) return hit
       }
     }
@@ -130,24 +169,33 @@ export class GuardianService extends Service {
     return false
   }
 
-  /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
-  private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine']): Interception | false {
-    if (rule.action === 'deny') {
-      this.audit({ level: 'deny', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
-      return { intercepted: true, reason: rule.reason, ruleId: rule.id, action: 'deny', engine }
+  /** 处理单条命中规则：deny 直接拦；block 走人工确认；混淆变体命中 log 级规则升级为 block */
+  private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine'], via: TransformKind[] = []): Interception | false {
+    let action = rule.action
+    let reason = rule.reason
+    if (via.length) {
+      reason = `混淆变形后命中（${via.map((t) => TRANSFORM_LABELS[t]).join('→')}）：${rule.reason}`
+      // 混淆 = 刻意规避检测的意图证据：log 升级为人工确认；
+      // block/deny 保持原级（deny 已是顶，block 保留人在环），误伤可控
+      if (this.escalateObfuscated && action === 'log') action = 'block'
     }
-    if (rule.action === 'block') {
-      this.audit({ level: 'block', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
+    const extra = via.length ? { via } : {}
+    if (action === 'deny') {
+      this.audit({ level: 'deny', engine, tool: toolName, ruleId: rule.id, reason, snippet, ...extra })
+      return { intercepted: true, reason, ruleId: rule.id, action: 'deny', engine, ...extra }
+    }
+    if (action === 'block') {
+      this.audit({ level: 'block', engine, tool: toolName, ruleId: rule.id, reason, snippet, ...extra })
       // 宿主提供 'guardian/approve' 监听器做人工确认，约定返回 { approved: boolean }
       const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
       const approved = typeof res === 'object' && res !== null && (res as any).approved === true
       if (!approved) {
-        return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine }
+        return { intercepted: true, reason: `${reason}（未获批准）`, ruleId: rule.id, action: 'block', engine, ...extra }
       }
       return false   // 已批准 → 放行本条，继续后续引擎
     }
     // log：仅记录，放行
-    this.audit({ level: 'allow', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
+    this.audit({ level: 'allow', engine, tool: toolName, ruleId: rule.id, reason, snippet, ...extra })
     return false
   }
 
@@ -180,6 +228,12 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用混淆消解（零宽/Unicode Tags/base64/实体等解码后再扫，默认 true） */
+    deobfuscate?: boolean
+    /** 混淆变形命中 log 级规则时升级为人工确认 block（默认 true） */
+    escalateObfuscated?: boolean
+    /** 检测到混淆但未命中规则时是否记录审计（默认 true） */
+    auditObfuscation?: boolean
   }
 }
 
