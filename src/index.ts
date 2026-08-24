@@ -6,6 +6,10 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import {
+  diffManifests, manifestFingerprint, pinManifest, toBaseline,
+  type BaselineEntry, type IntegrityOptions, type ManifestFinding, type ManifestVerdict, type ToolSpec,
+} from './integrity.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +17,15 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export {
+  canonicalJson, diffManifests, hashToolSpec, manifestFingerprint, normalizeName, diceSimilarity, pinManifest, toBaseline,
+  type BaselineEntry, type IntegrityOptions, type ManifestFinding, type ManifestFindingKind, type ManifestVerdict, type ToolSpec,
+} from './integrity.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'integrity'
   tool?: string
   ruleId?: string
   reason?: string
@@ -49,6 +57,7 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ * 另有独立通道：guardian/path 路径沙箱、guardian/tools 工具清单完整性（rug-pull 检测）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +67,13 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 引擎 6：工具清单完整性（rug-pull 检测） */
+  private enableIntegrity: boolean
+  private newToolPolicy: NonNullable<IntegrityOptions['newToolPolicy']>
+  /** 配置 pin 的锁基线（name → hash），类似 package-lock；设置后配置即权威 */
+  private pinnedTools?: Map<string, BaselineEntry>
+  /** 会话级基线：sessionId → (name → BaselineEntry)，首次观察即 pin */
+  private toolBaselines = new Map<string, Map<string, BaselineEntry>>()
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +82,16 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableIntegrity = config.checkToolIntegrity ?? true
+    this.newToolPolicy = config.newToolPolicy ?? 'block'
+    if (config.manifestBaseline) {
+      this.pinnedTools = new Map(
+        Object.entries(Array.isArray(config.manifestBaseline)
+          ? pinManifest(config.manifestBaseline)
+          : config.manifestBaseline,
+        ).map(([name, hash]) => [name, { hash }]),
+      )
+    }
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -82,6 +108,12 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 独立的工具清单完整性通道：宿主在会话开始/收到 tools/list 刷新时调用
+    // 用法：const v = ctx.bail('guardian/tools', sessionId, toolSpecs)；v.safe===false 即拒绝加载该清单
+    ctx.on('guardian/tools' as any, (sessionId: string, tools: ToolSpec[]) => {
+      return this.checkToolManifest(sessionId, tools)
+    }, true)
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -91,6 +123,58 @@ export class GuardianService extends Service {
       this.audit({ level: 'deny', engine: 'rule', tool: 'fs', ruleId: 'PATH-SANDBOX', reason: verdict.reason, snippet: target.slice(0, 300) })
     }
     return verdict
+  }
+
+  /**
+   * 引擎 6：工具清单完整性校验（rug-pull 检测）。
+   * 宿主在会话开始与每次收到 tools/list 刷新时调用（或经 guardian/tools 通道）。
+   * 语义：首次观察即 pin 基线（或用配置 manifestBaseline pin）；之后任何
+   * 描述/schema 变更、中途新增工具、同名仿冒都要求重新授权，deny 级直接拒绝。
+   */
+  checkToolManifest(sessionId: string, tools: ToolSpec[]): ManifestVerdict {
+    const fingerprint = manifestFingerprint(tools)
+    if (!this.enableIntegrity) return { safe: true, findings: [], fingerprint }
+
+    const state = this.toolBaselines.get(sessionId)
+    if (!state && !this.pinnedTools) {
+      // 首次观察：建立会话基线（"批准时刻 pin"）
+      this.toolBaselines.set(sessionId, toBaseline(tools))
+      this.audit({ level: 'allow', engine: 'integrity', tool: 'manifest', ruleId: 'TI-000', reason: `工具清单基线已建立（${tools.length} 个工具，指纹 ${fingerprint}）` })
+      return { safe: true, findings: [], fingerprint }
+    }
+    const baseline = this.pinnedTools ?? state!
+
+    const findings = diffManifests(baseline, tools, { newToolPolicy: this.newToolPolicy })
+    const effective = toBaseline(tools)
+    const reported: ManifestFinding[] = []
+    let safe = true
+
+    for (const f of findings) {
+      if (f.severity === 'deny') {
+        this.audit({ level: 'deny', engine: 'integrity', tool: 'manifest', ruleId: f.ruleId, reason: f.reason, snippet: f.detail })
+        reported.push(f)
+        safe = false
+      } else if (f.severity === 'block') {
+        // 复用 guardian/approve 人工确认通道：批准即"重新授权"，基线更新为新定义
+        const res = this.ctx.bail('guardian/approve' as any, { tool: 'manifest', rule: { id: f.ruleId, reason: f.reason, action: 'block' }, snippet: f.detail ?? '' } as any)
+        const approved = typeof res === 'object' && res !== null && (res as any).approved === true
+        if (!approved) {
+          this.audit({ level: 'block', engine: 'integrity', tool: 'manifest', ruleId: f.ruleId, reason: `${f.reason}（未获批准）`, snippet: f.detail })
+          reported.push(f)
+          safe = false
+          effective.delete(f.tool)   // 未授权的变更不进新基线，下轮继续报警
+        } else {
+          this.audit({ level: 'allow', engine: 'integrity', tool: 'manifest', ruleId: f.ruleId, reason: `${f.reason}（已人工重授权）`, snippet: f.detail })
+        }
+      } else {
+        this.audit({ level: 'allow', engine: 'integrity', tool: 'manifest', ruleId: f.ruleId, reason: f.reason, snippet: f.detail })
+        reported.push(f)
+      }
+    }
+
+    // 会话基线更新（pin 模式下配置即权威，不改）
+    if (!this.pinnedTools && safe) this.toolBaselines.set(sessionId, effective)
+    return { safe, findings: reported, fingerprint }
   }
 
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
@@ -180,6 +264,16 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用工具清单完整性校验（默认 true） */
+    checkToolIntegrity?: boolean
+    /** 会话中途新增工具的处置：'block'（默认，人工确认）| 'deny' | 'log' | 'allow' */
+    newToolPolicy?: 'deny' | 'block' | 'log' | 'allow'
+    /**
+     * 工具清单 pin 锁基线（类似 package-lock 的角色）。
+     * 传 ToolSpec[] 会自动计算 hash；或直接传 pinManifest() 生成的 name→hash 映射。
+     * 设置后配置即权威，任何漂移都要求重新授权。
+     */
+    manifestBaseline?: ToolSpec[] | Record<string, string>
   }
 }
 
