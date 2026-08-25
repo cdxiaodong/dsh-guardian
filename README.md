@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **污点追踪引擎**（`guardian/taint` + `taint.ts`）：跨调用的信息流控制（IFC）——其余引擎都是"单点检测"，本引擎追踪数据**流向**：敏感内容（.env/PII/内部配置）进入上下文时注册污点源（shingle 指纹），之后任何工具调用参数携带该内容（原文 / base64 / hex / URL 编码 / ROT13 变体）即拦截，需人工授予 capability 才放行。借鉴 DeepMind **CaMeL**（security labels + capability-based control）——"批准读取 ≠ 批准外传"
 
 ## 🚦 三级处置
 
@@ -70,7 +71,11 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 敏感内容进入上下文后注册污点源（读 .env / 私钥 / PPI 后调用）
+ctx.bail('guardian/taint', { id: 'fs:.env', description: '生产 .env 配置', content: envText })
+// 此后任何工具调用参数携带该内容（含 base64/hex/URL/ROT13 变体）都会被拦，需人工批准才外传
+
+// ⑤ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
@@ -79,14 +84,15 @@ console.log(ctx.guardian.readAudit(20))
 | Cordis / 时空可组合概念 | 本插件体现 |
 |---|---|
 | 响应式协效应（provide/inject） | `provide=['guardian']` 对外提供服务；依赖 cordis 事件系统 |
-| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
+| 可逆效应（Revertible Effects） | `ctx.effect(() => () => ...)` 注册撤销函数，卸载自动关文件流、停污点清扫定时器、清空污点池，零残留 |
 | 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
-| 隔离机制 | 多实例可绑定独立配置/白名单 |
+| 事件传播（prepend） | 多通道（check/path/taint/approve）各司其职，prepend 保证护栏先于业务逻辑 |
+| 隔离机制 | 多实例可绑定独立配置/白名单；污点池随实例生命周期销毁 |
 
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 35/35 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +106,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [CaMeL: Defeating Prompt Injections by Design（DeepMind, 2025）](https://arxiv.org/abs/2503.18813) — 污点追踪引擎的 security-label + capability 思想与 shingle 指纹近似匹配（借鉴文本查重的 rolling-hash 方案）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
