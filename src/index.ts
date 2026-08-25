@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { TaintPool, DEFAULT_TAINT_CONFIG, type TaintEngineConfig, type TaintSource, type TaintHit } from './taint.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { TaintPool, fnv1a, normalizeText, shingles, decodeVariants, DEFAULT_TAINT_CONFIG, type TaintEngineConfig, type TaintSource, type TaintHit, type TaintVariant } from './taint.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'taint'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ *  3. taint  —— 污点追踪：跨调用信息流控制（CaMeL 式，guardian/taint 注册源）
+ *  4. ssrf   —— 内网/元数据地址访问
+ * 另有独立通道 guardian/path 做路径沙箱校验。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +62,7 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private taintPool: TaintPool | null
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -69,8 +74,26 @@ export class GuardianService extends Service {
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
-    // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
-    ctx.effect(() => () => this.stream.end())
+    // 引擎 12：污点追踪（CaMeL 式信息流控制）
+    const taintCfg = { ...DEFAULT_TAINT_CONFIG, ...(config.taint ?? {}) }
+    this.taintPool = taintCfg.enable ? new TaintPool(taintCfg) : null
+
+    // 可逆效应：插件卸载时自动关闭文件流 + 停止污点清扫定时器 + 清空污点池（时空可组合-时间维度）
+    let sweepTimer: NodeJS.Timeout | null = null
+    if (this.taintPool && taintCfg.sweepIntervalMs > 0) {
+      sweepTimer = setInterval(() => {
+        const expired = this.taintPool!.sweep()
+        for (const id of expired) {
+          this.audit({ level: 'allow', engine: 'taint', ruleId: 'TAINT-EXPIRE', reason: `污点源过期清除：${id}` })
+        }
+      }, taintCfg.sweepIntervalMs)
+      sweepTimer.unref?.()
+    }
+    ctx.effect(() => () => {
+      if (sweepTimer) clearInterval(sweepTimer)
+      this.taintPool?.clear()
+      this.stream.end()
+    })
 
     // 护栏最先执行（prepend）
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
@@ -81,6 +104,15 @@ export class GuardianService extends Service {
     // 用法：const v = ctx.bail('guardian/path', targetPath)；v.safe===false 即拦截
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
+    }, true)
+
+    // 污点源注册通道：宿主在敏感内容（.env / 私钥 / PII）进入 Agent 上下文后调用
+    // 用法：ctx.bail('guardian/taint', { id, description, content }) → 返回 true=已注册
+    ctx.on('guardian/taint' as any, (src: TaintSource) => {
+      if (!this.taintPool) return false
+      this.taintPool.register(src)
+      this.audit({ level: 'allow', engine: 'taint', ruleId: 'TAINT-REGISTER', reason: `注册污点源：${src.description}`, snippet: src.id.slice(0, 300) })
+      return true
     }, true)
   }
 
@@ -113,6 +145,18 @@ export class GuardianService extends Service {
         const first = secretHits[0]
         this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `检测到明文密钥：${first.description}（${first.match}）`, snippet: text.slice(0, 300) })
         return { intercepted: true, reason: `检测到明文密钥：${first.description}`, ruleId: first.ruleId, action: 'deny', engine: 'secret' }
+      }
+    }
+
+    // 引擎 12：污点追踪（跨调用信息流控制，CaMeL 式 capability 授权）
+    if (this.taintPool) {
+      const taintHits = this.taintPool.match(text)
+      if (taintHits.length) {
+        const first = taintHits[0]
+        const variantNote = first.variant === 'plain' ? '' : `（经 ${first.variant} 编码变体检出，${first.matched} 处指纹重合）`
+        const rule = { id: 'TAINT-EXFIL', reason: `污点数据外传：payload 携带「${first.description}」的内容${variantNote}`, action: this.taintPool.config.action }
+        const hit = this.handleRule(toolName, rule, text.slice(0, 300), 'taint')
+        if (hit) return hit
       }
     }
 
@@ -180,6 +224,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 引擎 12：污点追踪配置（默认启用） */
+    taint?: TaintEngineConfig
   }
 }
 
