@@ -1,15 +1,17 @@
 import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
+import { type TaintEngineConfig } from './taint.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { TaintPool, fnv1a, normalizeText, shingles, decodeVariants, DEFAULT_TAINT_CONFIG, type TaintEngineConfig, type TaintSource, type TaintHit, type TaintVariant } from './taint.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'taint';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -34,10 +36,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ *  3. taint  —— 污点追踪：跨调用信息流控制（CaMeL 式，guardian/taint 注册源）
+ *  4. ssrf   —— 内网/元数据地址访问
+ * 另有独立通道 guardian/path 做路径沙箱校验。
  */
 export declare class GuardianService extends Service {
     private stream;
@@ -47,6 +51,7 @@ export declare class GuardianService extends Service {
     private enableSSRF;
     private enablePath;
     private allowedRoots;
+    private taintPool;
     constructor(ctx: Context, config?: GuardianService.Config);
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
@@ -71,6 +76,8 @@ export declare namespace GuardianService {
         checkPaths?: boolean;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
+        /** 引擎 12：污点追踪配置（默认启用） */
+        taint?: TaintEngineConfig;
     }
 }
 export declare const provide: string[];
