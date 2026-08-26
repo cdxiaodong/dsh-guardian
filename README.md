@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **攻击记忆引擎**（`attack-memory.ts`）：**自学习攻击向量库**——被拦截的攻击自动落库（磁盘持久化 + 审计日志自举），此后换 IP/路径/数字的**同形状**攻击、改写措辞的**变种**攻击，即使绕过所有正则也会被 `MEMORY-EXACT` / `MEMORY-VARIANT` 命中。借鉴 Rebuff 的 self-hardening 思想（攻击写库、相似再现即报警），但用确定性本地算法（双指纹 + token Jaccard）替代 embedding + 向量库，零外部依赖、可离线、可审计。人工批准过的操作不进记忆/批准后遗忘，绝不"批一次、永远拦"
 
 ## 🚦 三级处置
 
@@ -54,6 +55,10 @@ const ctx = new Context()
 ctx.plugin(guardian, {
   allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
   scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  attackMemory: {                           // 可选：攻击记忆（默认开启）
+    threshold: 0.55,                        //   变种判定相似度阈值
+    maxRecords: 500,                        //   记忆容量（LRU）
+  },
 })
 
 // ① 接入人工批准（无此监听器时 block 级默认拒绝）
@@ -86,7 +91,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 43/43 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -96,7 +101,7 @@ npm ci && npm test     # 19/19 通过
 - [gitleaks](https://github.com/gitleaks/gitleaks) — 密钥正则库 + 熵过滤
 - [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) — 密钥检测器设计
 - [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline 架构
-- [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想
+- [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想 + self-hardening 攻击记忆（本仓库攻击记忆引擎的确定性本地化实现来源）
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
