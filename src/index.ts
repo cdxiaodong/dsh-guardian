@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { AttackMemory } from './attack-memory.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { AttackMemory, normalizePayload, strictNormalize, fingerprint, strictFingerprint, tokenSet, jaccard, type AttackRecord, type MemoryHit } from './attack-memory.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'memory'
   tool?: string
   ruleId?: string
   reason?: string
@@ -30,6 +32,8 @@ export interface Interception {
   ruleId: string
   action: Rule['action']
   engine: AuditEntry['engine']
+  /** 记忆引擎命中时，指向被记忆的原始攻击所命中的规则 ID */
+  sourceRuleId?: string
 }
 
 declare module 'cordis' {
@@ -45,10 +49,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎（guardian/check 通道内依次执行）：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. memory —— 攻击记忆（历史攻击指纹/变种的最后一道网，自学习）
+ * 另有独立通道：guardian/path —— 路径沙箱（realpath + 白名单）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +64,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 攻击记忆库（attackMemory:false 时为 undefined） */
+  private memory?: AttackMemory
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -71,6 +79,18 @@ export class GuardianService extends Service {
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
     ctx.effect(() => () => this.stream.end())
+
+    // 攻击记忆引擎：载入磁盘记忆 + 从审计日志自举（历史 deny/未批准 block 即攻击语料）
+    if (config.attackMemory !== false) {
+      this.memory = new AttackMemory(
+        typeof config.attackMemory === 'object' ? config.attackMemory : {},
+      )
+      const fromDisk = this.memory.load()
+      this.bootstrapMemoryFromAudit()
+      if (this.memory.size()) {
+        this.audit({ level: 'allow', engine: 'memory', reason: `攻击记忆就绪：${this.memory.size()} 条（磁盘 ${fromDisk} + 审计自举）` })
+      }
+    }
 
     // 护栏最先执行（prepend）
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
@@ -96,7 +116,20 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+    const result = this.runChecks(toolName, text)
+    // 自学习：真正被拦截（deny / block 未获批准）的攻击写入记忆，下次变种也逃不掉
+    if (result && this.memory) {
+      this.memory.remember(text, {
+        ruleId: result.sourceRuleId ?? result.ruleId,
+        severity: result.action === 'deny' ? 'deny' : 'block',
+        tool: toolName,
+      })
+    }
+    return result
+  }
 
+  /** 各引擎依次判定（check 负责记忆学习，此处纯判定） */
+  private runChecks(toolName: string, text: string): Interception | false {
     // 引擎 1：危险规则
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
@@ -127,14 +160,54 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 4：攻击记忆（规则全 miss 后的最后一道网——历史攻击的指纹/变种仍在库）
+    if (this.memory) {
+      const hit = this.memory.lookup(text)
+      if (hit) {
+        const ruleId = hit.kind === 'exact' ? 'MEMORY-EXACT' : 'MEMORY-VARIANT'
+        const reason = hit.kind === 'exact'
+          ? `攻击记忆：与 ${hit.record.ts} 被拦截的「${hit.record.ruleId}」指纹完全一致（重复攻击）`
+          : `攻击记忆：与已知攻击「${hit.record.ruleId}」相似度 ${(hit.similarity * 100).toFixed(0)}%（疑似变种）`
+        // 精确重复沿用原判级别（deny 的永远 deny）；变种一律人工确认
+        const action: Rule['action'] = hit.kind === 'exact' ? hit.record.severity : 'block'
+        const res = this.handleRule(toolName, { id: ruleId, reason, action }, text.slice(0, 300), 'memory', hit.record.ruleId)
+        if (res) return res
+        // 用户人工批准了"精确重复"命中 → 遗忘该指纹（批准一次不再反复打扰）
+        if (hit.kind === 'exact') this.memory.forget(hit.record.fp)
+        return false
+      }
+    }
+
     return false
   }
 
+  /**
+   * 从审计日志自举攻击记忆：历史 deny 与"未被批准的 block"即攻击语料库。
+   * block 条目若紧随 approved:<id> 的补偿 allow 条目（同 ruleId+snippet），说明用户已批准，不学习。
+   */
+  private bootstrapMemoryFromAudit() {
+    if (!this.memory) return
+    const entries = this.readAudit(1000)
+    const approved = new Set(entries
+      .filter((e) => e.level === 'allow' && e.reason?.startsWith('approved:') && e.ruleId && e.snippet)
+      .map((e) => `${e.ruleId} ${e.snippet}`))
+    for (const e of entries) {
+      if (!e.snippet) continue
+      if (e.level === 'deny') {
+        this.memory.remember(e.snippet, { ruleId: e.ruleId ?? 'AUDIT', severity: 'deny', tool: e.tool })
+      } else if (e.level === 'block' && !approved.has(`${e.ruleId} ${e.snippet}`)) {
+        // 记忆引擎自身产生的 block 不重复学习（其来源已在落库时传播）
+        if (e.ruleId?.startsWith('MEMORY-')) continue
+        this.memory.remember(e.snippet, { ruleId: e.ruleId ?? 'AUDIT', severity: 'block', tool: e.tool })
+      }
+    }
+  }
+
   /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
-  private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine']): Interception | false {
+  private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine'], sourceRuleId?: string): Interception | false {
     if (rule.action === 'deny') {
       this.audit({ level: 'deny', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
-      return { intercepted: true, reason: rule.reason, ruleId: rule.id, action: 'deny', engine }
+      return { intercepted: true, reason: rule.reason, ruleId: rule.id, action: 'deny', engine, ...(sourceRuleId ? { sourceRuleId } : {}) }
     }
     if (rule.action === 'block') {
       this.audit({ level: 'block', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
@@ -142,8 +215,10 @@ export class GuardianService extends Service {
       const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
       const approved = typeof res === 'object' && res !== null && (res as any).approved === true
       if (!approved) {
-        return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine }
+        return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine, ...(sourceRuleId ? { sourceRuleId } : {}) }
       }
+      // 补偿条目：供攻击记忆自举时识别"该 block 已被人工批准，不学习"
+      this.audit({ level: 'allow', engine, tool: toolName, ruleId: rule.id, reason: `approved:${rule.id}`, snippet })
       return false   // 已批准 → 放行本条，继续后续引擎
     }
     // log：仅记录，放行
@@ -166,6 +241,9 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 攻击记忆库（attackMemory:false 时为 undefined），可查 size()/forget(fp) 等 */
+  get attackMemory(): AttackMemory | undefined { return this.memory }
 }
 
 export namespace GuardianService {
@@ -180,6 +258,11 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /**
+     * 攻击记忆引擎（默认开启）：true=默认配置；对象=细配（file/threshold/maxRecords/minTokens）；false=关闭。
+     * 被拦截的攻击自动进入记忆库，换 IP/路径/措辞的重复与变种攻击会被 MEMORY-EXACT / MEMORY-VARIANT 命中。
+     */
+    attackMemory?: boolean | AttackMemory.Config
   }
 }
 

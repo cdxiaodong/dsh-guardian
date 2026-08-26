@@ -1,13 +1,22 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import { Context } from 'cordis'
 import * as plugin from '../lib/index.js'
 
 const { DEFAULT_RULES, scanSecrets, scanNetworkTarget } = plugin
 
-function makeCtx() {
+// 临时目录隔离：审计日志与攻击记忆不落家目录，且不受历史日志自举影响
+function makeCtx(extra = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-test-'))
   const root = new Context()
-  root.plugin(plugin)
+  root.plugin(plugin, {
+    logFile: path.join(dir, 'audit.log'),
+    attackMemory: { file: path.join(dir, 'memory.json') },
+    ...extra,
+  })
   return root
 }
 const wait = () => new Promise(r => setTimeout(r, 200))
@@ -146,8 +155,13 @@ test('路径沙箱：../ 逃逸被 realpath 解析后拦截', async () => {
 })
 
 test('路径沙箱：白名单根目录约束', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardian-test-'))
   const root = new Context()
-  root.plugin(plugin, { allowedRoots: ['/home/user/workspace'] })
+  root.plugin(plugin, {
+    allowedRoots: ['/home/user/workspace'],
+    logFile: path.join(dir, 'audit.log'),
+    attackMemory: { file: path.join(dir, 'memory.json') },
+  })
   await wait()
   const g = root.guardian
   assert.equal(g.checkPathAccess('/home/user/workspace/a.ts').safe, true)
