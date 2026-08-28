@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { EgressBudget, isEgressTool, type BudgetDimension, type BudgetUsage, type BudgetViolation } from './egress.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { EgressBudget, isEgressTool, estimateBytes, fmtBytes, EGRESS_TOOL_RE, type BudgetDimension, type BudgetUsage, type BudgetViolation } from './egress.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'budget'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,13 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎（guardian/check 通道内依次执行）：
+ *  0. budget —— 出境预算：调用频次滑窗（在内容引擎之前——被拦的尝试也是行为信号）
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. budget —— 出境体积记账：内容引擎全放行后，出境类工具的 payload 记账（累计/峰值）
+ * 另有独立通道：guardian/path —— 路径沙箱（realpath + 白名单）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +63,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 出境预算记账器（egressBudget:false 时为 undefined） */
+  private budget?: EgressBudget
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +73,11 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    if (config.egressBudget !== false) {
+      this.budget = new EgressBudget(
+        typeof config.egressBudget === 'object' ? config.egressBudget : {},
+      )
+    }
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -96,6 +108,40 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：出境预算-频次（内容引擎之前：被拦的尝试同样暴露失控循环/扫描行为）
+    if (this.budget) {
+      const v = this.budget.observeCall(toolName)
+      if (v) {
+        const hit = this.handleBudget(toolName, v, text.slice(0, 300))
+        if (hit) return hit
+      }
+    }
+
+    const result = this.runContentChecks(toolName, text)
+    if (result) return result
+
+    // 引擎 4：出境预算-体积（内容引擎全放行后记账——数据即将离机，才计出境字节；
+    // 非出境类工具不记账。超限走人工确认，批准即重置该维度窗口）
+    if (this.budget && isEgressTool(toolName)) {
+      const v = this.budget.observeEgress(text, toolName)
+      if (v) {
+        const hit = this.handleBudget(toolName, v, text.slice(0, 300))
+        if (hit) return hit
+      }
+    }
+    return false
+  }
+
+  /** 预算违规处理：block 走人工确认；批准即重置该维度窗口（合法大上传只打扰一次） */
+  private handleBudget(toolName: string, v: BudgetViolation, snippet: string): Interception | false {
+    const hit = this.handleRule(toolName, { id: v.ruleId, reason: v.reason, action: 'block' }, snippet, 'budget')
+    if (!hit && this.budget) this.budget.reset(v.dimension)
+    return hit
+  }
+
+  /** 内容检测引擎（纯判定；预算逻辑在 check 中环绕） */
+  private runContentChecks(toolName: string, text: string): Interception | false {
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -166,6 +212,9 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 出境预算记账器（egressBudget:false 时为 undefined），可查 usage()/reset(dim) 等 */
+  get egressBudget(): EgressBudget | undefined { return this.budget }
 }
 
 export namespace GuardianService {
@@ -180,6 +229,13 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /**
+     * 出境预算引擎（默认开启）：true=默认配置；对象=细配（windowMs/maxEgressBytes/
+     * maxPayloadBytes/maxCalls）；false=关闭。
+     * 内容无关的量化防线：滑窗累计出境字节（分块渗出）、单次峰值（批量外传）、
+     * 调用频次（失控循环）。超限走人工确认，批准即重置窗口。
+     */
+    egressBudget?: boolean | EgressBudget.Config
   }
 }
 

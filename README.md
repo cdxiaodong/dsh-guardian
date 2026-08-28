@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **出境预算引擎**（`egressBudget`，默认开启）：内容无关的量化防线——滑动时间窗内累计出境字节（分块渗出 low-and-slow）、单次出境峰值（批量外传）、调用频次（失控循环/自动化扫描）。字节守恒：攻击者可加密/编码绕过一切内容检测，但数据离机必占字节。超限走人工确认，**批准即重置**窗口（合法大上传只打扰一次）。借鉴 arXiv:2604.05432 per-tool quotas、Sophos Lethal Trifecta 的 egress restriction、Cloudflare 滑动窗限流算法。
 
 ## 🚦 三级处置
 
@@ -54,6 +55,12 @@ const ctx = new Context()
 ctx.plugin(guardian, {
   allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
   scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  egressBudget: {                            // 可选：出境预算（默认开启，此为默认值）
+    windowMs: 60_000,                        // 滑动时间窗
+    maxEgressBytes: 512 * 1024,              // 窗口内累计出境上限（分块渗出检测）
+    maxPayloadBytes: 1024 * 1024,            // 单次出境峰值上限（批量外传检测）
+    maxCalls: 120,                           // 窗口内调用次数上限（失控循环检测）
+  },
 })
 
 // ① 接入人工批准（无此监听器时 block 级默认拒绝）
