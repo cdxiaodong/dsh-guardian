@@ -28,6 +28,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
+- **工具定义毒性扫描**（`guardian/tooldef`）：注册外部工具/MCP server 时扫描 description 与 schema 嵌套字段的注入指令；Unicode Tags 隐形注入**显影**为可读明文、双向文本（RLO）视觉伪装、HTML 注释藏指令、敏感源外传指使、工具名抢注（同形异码）——确定性版 mcp-scan，零基线依赖
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 
 ## 🚦 三级处置
@@ -70,7 +71,15 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 注册外部工具/MCP server 前做毒性扫描（确定性版 mcp-scan）
+const td = ctx.bail('guardian/tooldef', toolDef /* { name, description, inputSchema } */,
+                    { reservedNames: ['read_file', 'search'] })
+if (td && td.safe === false) {
+  // findings 含规则号与显影后的审计片段，可直接展示给用户
+  throw new Error(`工具定义毒性：${td.findings[0].reason}（${td.findings[0].excerpt}）`)
+}
+
+// ⑤ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
@@ -86,7 +95,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 40/40 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -99,6 +108,7 @@ npm ci && npm test     # 19/19 通过
 - [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
+- [Invariant Labs mcp-scan](https://github.com/invariant-labs/mcp-scan) 与 [Tool Poisoning Attacks 研究](https://invariantlabs.ai/blog/tool-poisoning-attacks) — 工具描述即 prompt 的威胁模型、隐形字符/HTML 注释检测思路（本仓库引擎 15 做其确定性、无 LLM 的运行时版本）
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
