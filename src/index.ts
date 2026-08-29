@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanToolDefinition, type ToolDefInput, type ToolDefVerdict, type ScanOptions } from './toolpoison.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scanToolDefinition, verdictOf, developTags, tagsPayload, normalizeToolName, collectSchemaTexts, TOOLPOISON_RULES, type ToolDefInput, type ToolDefVerdict, type PoisonFinding, type PoisonSeverity, type ScanOptions } from './toolpoison.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'toolpoison'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,14 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
- *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ * 四个检测通道：
+ *  1. rule      —— 危险命令 / 破坏操作 / 提示注入正则规则（guardian/check）
+ *  2. secret    —— 密钥/凭据泄露（gitleaks 风格，guardian/check）
+ *  3. ssrf      —— 内网/元数据地址访问（guardian/check）
+ *  4. toolpoison—— 工具定义毒性扫描（确定性版 mcp-scan，guardian/tooldef）：
+ *                  宿主/MCP adapter 注册外部工具时扫描 name/description/schema
+ *                  嵌套字段中的注入指令、Unicode Tags 隐形注入（显影）、双向文本
+ *                  伪装、敏感源外传指使与名称抢注。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +63,7 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableToolDefScan: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +72,7 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableToolDefScan = config.scanToolDefs ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -82,6 +90,33 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 工具定义毒性扫描通道：宿主/MCP adapter 在 tools/list 或注册外部工具时调用。
+    // 用法：const v = ctx.bail('guardian/tooldef', toolDef, { reservedNames: [...] })
+    //      v.safe===false → 拒绝注册；v.requiresReview → 曾有 suspect 命中（可能已经过人工批准）
+    ctx.on('guardian/tooldef' as any, (def: ToolDefInput, opts?: ScanOptions) => {
+      return this.checkToolDef(def, opts)
+    }, true)
+  }
+
+  /** 工具定义毒性校验（确定性版 mcp-scan，零基线依赖，首次接触即扫描） */
+  checkToolDef(def: ToolDefInput, opts?: ScanOptions): ToolDefVerdict {
+    if (!this.enableToolDefScan) return { safe: true, findings: [], requiresReview: false }
+    const findings = scanToolDefinition(def, opts)
+    const poison = findings.find((f) => f.severity === 'poison')
+    if (poison) {
+      this.audit({ level: 'deny', engine: 'toolpoison', tool: def.name, ruleId: poison.ruleId, reason: `工具定义毒性：${poison.reason}`, snippet: poison.excerpt })
+      return { safe: false, findings, requiresReview: false }
+    }
+    const suspect = findings.find((f) => f.severity === 'suspect')
+    if (suspect) {
+      this.audit({ level: 'block', engine: 'toolpoison', tool: def.name, ruleId: suspect.ruleId, reason: `工具定义可疑：${suspect.reason}`, snippet: suspect.excerpt })
+      // 走 guardian/approve 人工确认；无监听器或未批准 → 拒绝注册（fail-closed）
+      const res = this.ctx.bail('guardian/approve' as any, { tool: def.name, rule: { id: suspect.ruleId, reason: suspect.reason, action: 'block' }, snippet: suspect.excerpt } as any)
+      const approved = typeof res === 'object' && res !== null && (res as any).approved === true
+      return { safe: approved, findings, requiresReview: true }
+    }
+    return { safe: true, findings, requiresReview: false }
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -178,6 +213,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用工具定义毒性扫描（默认 true） */
+    scanToolDefs?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
