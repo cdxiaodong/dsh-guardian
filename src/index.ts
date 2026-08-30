@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanAndJudge, type RenderOptions, type RenderVerdict, type RenderFinding } from './render.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scanMarkdown, sanitizeMarkdown, scanAndJudge, verdictOf as renderVerdictOf, segmentMarkdown, parseUrl, decodeEntities, developTags as developRenderTags, type RenderSeverity, type RenderFinding, type RenderVerdict, type RenderOptions, type Segment } from './render.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'render'
   tool?: string
   ruleId?: string
   reason?: string
@@ -49,6 +51,9 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *
+ * 独立通道：guardian/path 路径沙箱；guardian/render 渲染层外泄
+ * （Markdown 注入 / 图片信标 / 链接显示欺骗，宿主渲染 Agent 输出前调用）。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +62,8 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableRender: boolean
+  private trustedImageHosts: string[]
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +72,8 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableRender = config.scanRender ?? true
+    this.trustedImageHosts = config.trustedImageHosts ?? []
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -82,6 +91,32 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 渲染层外泄扫描通道：宿主渲染 Agent 输出（Markdown）前调用。
+    // 用法：const v = ctx.bail('guardian/render', markdown)
+    //      v.safe===false → 不要原样渲染，改用 v.sanitized（图片信标移除/欺骗链接显真）
+    //      v.requiresReview → 可渲染但建议 UI 告警
+    ctx.on('guardian/render' as any, (md: string, opts?: RenderOptions) => {
+      return this.checkRender(md, opts)
+    }, true)
+  }
+
+  /**
+   * 渲染层外泄校验（Markdown 注入 / 图片信标 / 链接显示欺骗）。
+   * poison → 审计 deny 并返回 sanitized 替代版本；suspect → 审计 allow 仅告警。
+   */
+  checkRender(md: string, opts: RenderOptions = {}): RenderVerdict {
+    if (!this.enableRender) return { safe: true, findings: [], requiresReview: false, sanitized: md }
+    const merged: RenderOptions = { ...opts, trustedImageHosts: opts.trustedImageHosts ?? this.trustedImageHosts }
+    const verdict = scanAndJudge(md, merged)
+    const poison = verdict.findings.find((f) => f.severity === 'poison')
+    if (poison) {
+      this.audit({ level: 'deny', engine: 'render', ruleId: poison.ruleId, reason: `渲染层外泄：${poison.reason}`, snippet: poison.excerpt })
+    } else if (verdict.requiresReview) {
+      const suspect = verdict.findings.find((f) => f.severity === 'suspect')!
+      this.audit({ level: 'allow', engine: 'render', ruleId: suspect.ruleId, reason: `渲染层可疑：${suspect.reason}`, snippet: suspect.excerpt })
+    }
+    return verdict
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -178,6 +213,10 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用渲染层外泄扫描（默认 true） */
+    scanRender?: boolean
+    /** 可信图片域名：其图片 URL 带普通 query 不告警（精确/后缀匹配） */
+    trustedImageHosts?: string[]
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
