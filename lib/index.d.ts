@@ -1,19 +1,22 @@
 import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
+import { SessionAnchor } from './anchor.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { SessionAnchor, extractIntentHosts, extractEgressHosts, normalizeHost, AMBIENT_HOSTS, type AnchorEntity, type AnchorVerdict, type AnchorStats } from './anchor.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'anchor';
     tool?: string;
     ruleId?: string;
     reason?: string;
     snippet?: string;
+    foreignHosts?: string[];
 }
 export interface Interception {
     intercepted: true;
@@ -38,6 +41,8 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ * 会话开启后追加：
+ *  4. anchor —— 会话锚定（意图漂移检测，Unit 42 context-anchoring 的确定性实现）
  */
 export declare class GuardianService extends Service {
     private stream;
@@ -46,8 +51,15 @@ export declare class GuardianService extends Service {
     private enableSecret;
     private enableSSRF;
     private enablePath;
+    private enableAnchor;
     private allowedRoots;
+    private session;
     constructor(ctx: Context, config?: GuardianService.Config);
+    /** 开始新会话：以用户原始意图为锚点（覆盖旧会话） */
+    beginSession(intent: string): SessionAnchor;
+    /** 结束会话：锚点与已确认主机全部作废（下次会话重新授权） */
+    endSession(): void;
+    currentSession(): SessionAnchor | null;
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
     /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
@@ -69,6 +81,8 @@ export declare namespace GuardianService {
         scanSSRF?: boolean;
         /** 是否启用路径沙箱校验（默认 true） */
         checkPaths?: boolean;
+        /** 是否启用会话锚定/意图漂移检测（默认 true；无会话时自动旁路） */
+        sessionAnchoring?: boolean;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
     }

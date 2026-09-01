@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 六大检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,6 +24,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **ANCHOR** 会话锚定 | 意图漂移检测：会话开始锚定用户意图中的出站目的地，锚点外主机外传=被注入的标志（抓未知 0day 注入向量） | Unit 42 Context Anchoring（2025-10 A2A 会话走私研究） |
 
 外加：
 
@@ -70,6 +71,12 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
+// ③' （推荐）会话开始时建立意图锚点：用户意图中出现的主机 = 本会话合法出站目的地。
+//     之后 agent 若向锚点外主机外传数据（典型注入后行为）→ block 走人工确认；
+//     批准后该主机自动纳入锚点，本会话同目的地不再打扰。
+ctx.bail('guardian/anchor/begin', userMessage)   // 新会话/新任务时调用
+ctx.bail('guardian/anchor/end')                  // 会话结束时销毁锚点
+
 // ④ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
@@ -79,14 +86,14 @@ console.log(ctx.guardian.readAudit(20))
 | Cordis / 时空可组合概念 | 本插件体现 |
 |---|---|
 | 响应式协效应（provide/inject） | `provide=['guardian']` 对外提供服务；依赖 cordis 事件系统 |
-| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
+| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、销毁会话锚点、零残留 |
 | 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
 | 隔离机制 | 多实例可绑定独立配置/白名单 |
 
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 36/36 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +107,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [Unit 42: Agent Session Smuggling in Agent2Agent Systems](https://unit42.paloaltonetworks.com/agent-session-smuggling-in-agent2agent-systems/) — 会话锚定（Context Anchoring）防御思想
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
