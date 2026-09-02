@@ -28,6 +28,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
+- **ANSI 终端欺骗防御**（`ansi.ts` / 引擎 4）：检测工具输出中隐藏人眼、欺骗审核的终端转义序列（SGR 8 隐藏文本、行擦除覆盖、光标上跳 line-jumping、OSC 8 伪装链接、DSR 探测、C1 单字节绕过、JSON \u001b 字面量走私），安全色码（git diff / 256 色）零误报；提供三模式净化（`guardian/sanitize` 通道）与 `renderConsistency` 渲染一致性审计（量化"人看到的 vs LLM 收到的"差异），审计 snippet 强制可见化防二次欺骗。借鉴 Trail of Bits《Deceiving users with ANSI terminal codes in MCP》(2025)
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 
 ## 🚦 三级处置
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 41/41 通过
 ```
 
 ## 🙏 致谢 / 参考
