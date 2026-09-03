@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanDnsCovert, checkDns, DNS_DENY_RULES, type DnsHit, type DnsVerdict } from './dns.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scanDnsCovert, inspectDomain, checkDns, DNS_DENY_RULES, DOH_ENDPOINTS, type DnsHit, type DnsVerdict } from './dns.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'dns'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,11 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 四个检测引擎：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. dns    —— DNS 隐蔽信道（域名标签编码/DoH 隧道外泄）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +60,7 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableDns: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +69,7 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableDns = config.scanDnsCovert ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -82,6 +87,21 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 独立的 DNS 隧道校验通道：宿主发起 DNS 查询前调用
+    // 用法：const v = ctx.bail('guardian/dns', queryText)；v.safe===false 即拦截
+    ctx.on('guardian/dns' as any, (query: string) => {
+      return this.checkDnsQuery(query)
+    }, true)
+  }
+
+  /** DNS 隐蔽信道校验：域名标签编码 + DoH 隧道，返回 DnsVerdict */
+  checkDnsQuery(query: string): DnsVerdict {
+    const verdict = checkDns(query)
+    if (!verdict.safe) {
+      this.audit({ level: 'deny', engine: 'dns', tool: 'dns', ruleId: 'DNS-COVERT', reason: verdict.reason ?? 'DNS 隐蔽信道可疑', snippet: query.slice(0, 300) })
+    }
+    return verdict
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -123,6 +143,21 @@ export class GuardianService extends Service {
         const first = ssrfHits[0]
         const snippet = text.slice(0, 300)
         const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf')
+        if (hit) return hit
+      }
+    }
+
+    // 引擎 4：DNS 隐蔽信道（hex/base32/超长/分块标签 → deny；DoH 端点 → block）
+    if (this.enableDns) {
+      const dnsHits = scanDnsCovert(text)
+      if (dnsHits.length) {
+        const deny = dnsHits.find(h => DNS_DENY_RULES.has(h.ruleId))
+        if (deny) {
+          this.audit({ level: 'deny', engine: 'dns', tool: toolName, ruleId: deny.ruleId, reason: deny.reason, snippet: text.slice(0, 300) })
+          return { intercepted: true, reason: deny.reason, ruleId: deny.ruleId, action: 'deny', engine: 'dns' }
+        }
+        const first = dnsHits[0]
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, text.slice(0, 300), 'dns')
         if (hit) return hit
       }
     }
@@ -178,6 +213,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用 DNS 隐蔽信道检测（默认 true） */
+    scanDnsCovert?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
