@@ -1,15 +1,17 @@
 import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
+import { type DnsVerdict } from './dns.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { scanDnsCovert, inspectDomain, checkDns, DNS_DENY_RULES, DOH_ENDPOINTS, type DnsHit, type DnsVerdict } from './dns.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'dns';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -34,10 +36,11 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 四个检测引擎：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. dns    —— DNS 隐蔽信道（域名标签编码/DoH 隧道外泄）
  */
 export declare class GuardianService extends Service {
     private stream;
@@ -46,8 +49,11 @@ export declare class GuardianService extends Service {
     private enableSecret;
     private enableSSRF;
     private enablePath;
+    private enableDns;
     private allowedRoots;
     constructor(ctx: Context, config?: GuardianService.Config);
+    /** DNS 隐蔽信道校验：域名标签编码 + DoH 隧道，返回 DnsVerdict */
+    checkDnsQuery(query: string): DnsVerdict;
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
     /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
@@ -69,6 +75,8 @@ export declare namespace GuardianService {
         scanSSRF?: boolean;
         /** 是否启用路径沙箱校验（默认 true） */
         checkPaths?: boolean;
+        /** 是否启用 DNS 隐蔽信道检测（默认 true） */
+        scanDnsCovert?: boolean;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
     }
