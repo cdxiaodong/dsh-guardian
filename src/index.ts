@@ -6,6 +6,10 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import {
+  generateCanary, generateDecoyCanary, scanForCanary, redactCanary, canaryFingerprint,
+  type CanaryRecord, type CanaryHit,
+} from './canary.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +17,15 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export {
+  generateCanary, generateDecoyCanary, scanForCanary, redactCanary, canaryFingerprint,
+  CANARY_PREFIX, DECOY_PREFIX, type CanaryRecord, type CanaryHit, type CanaryVariant,
+} from './canary.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'canary'
   tool?: string
   ruleId?: string
   reason?: string
@@ -57,7 +65,10 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableCanary: boolean
   private allowedRoots: string[]
+  /** 蜜罐信标注册表：per-session 内存态，绝不落盘 */
+  private canaries = new Map<string, CanaryRecord>()
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -65,12 +76,13 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableCanary = config.canaryTrap ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
-    // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
-    ctx.effect(() => () => this.stream.end())
+    // 可逆效应：插件卸载时自动关闭文件流并清空 canary 注册表（时空可组合-时间维度）
+    ctx.effect(() => () => { this.stream.end(); this.canaries.clear() })
 
     // 护栏最先执行（prepend）
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
@@ -93,9 +105,46 @@ export class GuardianService extends Service {
     return verdict
   }
 
+  /**
+   * 植入蜜罐信标：把外部内容（网页/邮件/文档）喂给 Agent 前调用。
+   * 返回带 canary 的上下文；此后 canary 一旦出现在任何出境通道即被 deny。
+   *  - 默认中性形态：`[internal-tracking-ref: GUARDIAN-CANARY-…]`，不惊动注入指令
+   *  - decoy: true 蜜饵形态：伪装成 API key 裸 token，诱惑注入「优先偷它」
+   */
+  plantCanary(context: string, opts: { label?: string; decoy?: boolean } = {}) {
+    const decoy = opts.decoy ?? false
+    const token = decoy ? generateDecoyCanary() : generateCanary()
+    const marker = decoy ? token : `[internal-tracking-ref: ${token}]`
+    const wrapped = `${context}\n\n${marker}`
+    this.canaries.set(token, { token, label: opts.label ?? 'default', plantedAt: new Date().toISOString(), decoy })
+    return { context: wrapped, token }
+  }
+
+  /** 撤销信标：轮次结束 / token 疑似已泄露时调用，之后不再据此拦截 */
+  revokeCanary(token: string) { this.canaries.delete(token) }
+
+  /** 列出信标指纹（前 4 后 4），全文不离开内存 */
+  listCanaries(): Array<Omit<CanaryRecord, 'token'> & { fingerprint: string }> {
+    return [...this.canaries.values()].map(({ token, ...rest }) => ({ ...rest, fingerprint: canaryFingerprint(token) }))
+  }
+
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：canary 出境检测（最高优先级——确定性证据，且不能让数据走完后续引擎）
+    if (this.enableCanary && this.canaries.size) {
+      const hit = scanForCanary(text, this.canaries.keys())
+      if (hit) {
+        const fp = canaryFingerprint(hit.token)
+        this.audit({
+          level: 'deny', engine: 'canary', tool: toolName, ruleId: 'CANARY-EXFIL',
+          reason: `蜜罐信标 ${fp} 以 ${hit.variant} 变体出现在出境通道——上下文正被注入搬运（确定性证据）`,
+          snippet: redactCanary(text, hit),
+        })
+        return { intercepted: true, reason: `蜜罐信标 ${fp} 出现在出境通道（${hit.variant}）——检测到注入驱动的数据搬运`, ruleId: 'CANARY-EXFIL', action: 'deny', engine: 'canary' }
+      }
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -178,6 +227,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用蜜罐信标出境检测（默认 true；无注册信标时零开销） */
+    canaryTrap?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
