@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **能力衰减引擎**（`capability.ts` / `guardian/ingest`）：混淆代理人（Confused Deputy）防护——外部内容携带指令性话术进入上下文后，影响窗口内的副作用类工具（exec/write/delete/network/credential）自动降权为人工确认；人工批准后发放限定来源+类别+次数的委托凭证。判定依据是**会话信任状态**而非本次 payload 内容（CSA 2026 / oCap attenuation）
 
 ## 🚦 三级处置
 
@@ -70,6 +71,11 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
+// ③' 外部内容进 LLM 上下文前申报（confused deputy 防护）
+const ing = ctx.bail('guardian/ingest', 'web:example.com', fetchedContent)
+if (ing.polluted) console.warn(`不可信来源已进入衰减态：${ing.directives.map(d => d.ruleId)}`)
+// 此后 3 步内的副作用工具调用（exec/write/...）自动降为人工确认
+
 // ④ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
@@ -86,7 +92,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 40/40 通过
 ```
 
 ## 🙏 致谢 / 参考
