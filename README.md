@@ -28,6 +28,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
+- **持久化哨兵**（`persist.ts`，`guardian/persist`）：MITRE ATT&CK 持久化战术（T1053 cron / T1546.004 shell rc / T1098.004 authorized_keys / T1543 launchd+systemd / T1053.005 schtasks+Run 键）在工具调用层的前置拦截——EDR 在事后取证，这里在事前 bail；理解 payload 字段结构，读/写语义分开，目标面与载荷面交叉定级
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 
 ## 🚦 三级处置
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 32/32 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +101,8 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [MITRE ATT&CK](https://attack.mitre.org/) — 持久化战术技术编号（T1053/T1543/T1546/T1098）与检测数据源
+- [System Two Security](https://systemtwosecurity.com/detections/019f1434-0226-73df-814f-1da6c1618a7a) — AI agent 子进程持久化检测规则（crontab/authorized_keys/systemd）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 

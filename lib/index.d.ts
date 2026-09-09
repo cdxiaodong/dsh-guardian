@@ -5,11 +5,12 @@ export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
+export { scanPersistence, scanCommandForPersistence, scanFileWriteForPersistence, RC_FILENAMES, type PersistenceHit } from './persist.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'persist';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -38,6 +39,9 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ * 外加持久化哨兵引擎（persist）：MITRE ATT&CK 持久化战术（cron / shell rc /
+ * authorized_keys / launchd / systemd / schtasks / Run 键）的工具调用层前置拦截，
+ * 区分读/写语义，目标面与载荷面交叉定级（EDR 的事后取证 → 这里的事前 bail）。
  */
 export declare class GuardianService extends Service {
     private stream;
@@ -46,6 +50,7 @@ export declare class GuardianService extends Service {
     private enableSecret;
     private enableSSRF;
     private enablePath;
+    private enablePersist;
     private allowedRoots;
     constructor(ctx: Context, config?: GuardianService.Config);
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -69,6 +74,8 @@ export declare namespace GuardianService {
         scanSSRF?: boolean;
         /** 是否启用路径沙箱校验（默认 true） */
         checkPaths?: boolean;
+        /** 是否启用持久化安装检测（默认 true） */
+        checkPersistence?: boolean;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
     }
