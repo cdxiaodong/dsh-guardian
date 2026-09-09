@@ -6,18 +6,20 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanPersistence, scanCommandForPersistence, scanFileWriteForPersistence, RC_FILENAMES, type PersistenceHit } from './persist.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js'
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
+export { scanPersistence, scanCommandForPersistence, scanFileWriteForPersistence, RC_FILENAMES, type PersistenceHit } from './persist.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'persist'
   tool?: string
   ruleId?: string
   reason?: string
@@ -49,6 +51,9 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ * 外加持久化哨兵引擎（persist）：MITRE ATT&CK 持久化战术（cron / shell rc /
+ * authorized_keys / launchd / systemd / schtasks / Run 键）的工具调用层前置拦截，
+ * 区分读/写语义，目标面与载荷面交叉定级（EDR 的事后取证 → 这里的事前 bail）。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +62,7 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enablePersist: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +71,7 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enablePersist = config.checkPersistence ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -82,6 +89,17 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 独立的持久化校验通道：宿主写文件/执行命令前单独调用（不必走完整 check 流程）
+    // 用法：const hit = ctx.bail('guardian/persist', toolName, payload)；返回首个命中或 false
+    ctx.on('guardian/persist' as any, (toolName: string, payload: unknown) => {
+      if (!this.enablePersist) return false
+      const hits = scanPersistence(toolName, payload)
+      if (!hits.length) return false
+      const first = hits[0]
+      this.audit({ level: first.action, engine: 'persist', tool: toolName, ruleId: first.ruleId, reason: first.reason, snippet: first.match })
+      return first
+    }, true)
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -96,6 +114,19 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：持久化安装（cron/rc/authorized_keys/launchd/systemd/schtasks）。
+    // 语义引擎先于泛正则（引擎 1）：它理解 payload 字段结构，读/写语义分开，
+    // 目标面与载荷面交叉定级——authorized_keys 从泛规则的"敏感目录 block"
+    // 升级为"持久化战术 deny"，审计记录的 ruleId 也更接近真实威胁
+    if (this.enablePersist) {
+      const persistHits = scanPersistence(toolName, payload)
+      if (persistHits.length) {
+        const first = persistHits[0]
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: first.action }, first.match, 'persist')
+        if (hit) return hit
+      }
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -178,6 +209,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用持久化安装检测（默认 true） */
+    checkPersistence?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
