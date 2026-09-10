@@ -1,15 +1,17 @@
 import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
+import { MemoryIntegrityStore, type IntegrityResult, type MemoryVerdict } from './memory.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { isAgentContextFile, AGENT_CONTEXT_PATTERNS, MEMORY_RULES, scanMemoryContent, worstAction, guardMemoryWrite, MemoryIntegrityStore, type MemoryRule, type MemoryHit, type MemoryVerdict, type IntegrityResult, type IntegrityStatus, } from './memory.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'memory';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -46,10 +48,23 @@ export declare class GuardianService extends Service {
     private enableSecret;
     private enableSSRF;
     private enablePath;
+    private enableMemory;
     private allowedRoots;
+    /** 认知完整性基线（TOFU 哈希 pin） */
+    readonly integrity: MemoryIntegrityStore;
     constructor(ctx: Context, config?: GuardianService.Config);
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
+    /** 认知写入判定：非受保护文件直接放行；受保护文件按投毒规则判，干净则顺带 TOFU 建基线 */
+    checkMemoryWrite(target: string, content: string): MemoryVerdict;
+    /** 启动自检：校验受保护上下文文件是否偏离 TOFU 基线（宿主会话启动时逐个调用） */
+    verifyContextFile(target: string): IntegrityResult;
+    /**
+     * 识别"写 Agent 认知上下文文件"的工具调用：
+     *  1. 写入类工具名 + payload 中出现受保护路径（write_file/edit 等结构化调用）
+     *  2. shell 写入动词（重定向/tee/cp/mv/append）指向受保护文件（绕过结构化工具的逃逸路径）
+     */
+    private looksLikeContextWrite;
     /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
     check(toolName: string, payload: unknown): Interception | false;
     /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
@@ -69,6 +84,10 @@ export declare namespace GuardianService {
         scanSSRF?: boolean;
         /** 是否启用路径沙箱校验（默认 true） */
         checkPaths?: boolean;
+        /** 是否启用认知完整性引擎：Agent 上下文文件投毒检测（默认 true） */
+        guardMemory?: boolean;
+        /** 认知完整性 TOFU 基线存放路径（默认 ~/.dsh-guardian.memory.json） */
+        integrityFile?: string;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
     }
