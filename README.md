@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 六大检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,11 +24,13 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **MEM** 认知完整性 | 写 CLAUDE.md/AGENTS.md/.cursorrules/memory 目录时的投毒内容 + TOFU 哈希基线验篡改 | Rules File Backdoor、Invariant tool-poisoning、CBSE |
 
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **认知完整性**（`guardian/memory`）：防 2026 顶级威胁 **memory poisoning**——攻击者诱导 Agent 把恶意指令写进自己的上下文文件（写入动作人畜无害，OS 级持久化检测管不到，但下次会话以最高权限复活）。写时拦截 + TOFU（trust-on-first-write）哈希基线启动自检
 
 ## 🚦 三级处置
 
@@ -70,7 +72,17 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 写 Agent 上下文文件（CLAUDE.md/记忆等）前验投毒
+const m = ctx.bail('guardian/memory', targetPath, content)
+if (m && m.safe === false) throw new Error(`认知投毒被拦：${m.reason}`)
+
+// ⑤ 会话启动时自检记忆完整性（TOFU 基线，篡改即 modified）
+for (const f of ['CLAUDE.md', 'AGENTS.md', '.cursorrules']) {
+  const r = ctx.guardian.verifyContextFile(f)
+  if (r.status === 'modified') warnUser(`${f} 偏离基线，疑被投毒`)
+}
+
+// ⑥ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
