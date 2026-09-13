@@ -6,10 +6,11 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { compileSentinelMatcher, resolveSentinelAssets, scanSentinel, FORENSIC_RULES, type SentinelAsset, type SentinelHit, type SentinelMatcher, type SentinelOptions, } from './sentinel.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'sentinel';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -34,7 +35,8 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎：
+ *  0. sentinel —— 哨兵自防护：谁在动护栏自己（删审计日志/改源码/卸载/杀进程）+ 反取证
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
@@ -46,7 +48,10 @@ export declare class GuardianService extends Service {
     private enableSecret;
     private enableSSRF;
     private enablePath;
+    private enableSentinel;
     private allowedRoots;
+    /** 哨兵匹配器：护栏自防护（动词×护栏资产矩阵 + FORENSIC 反取证规则组） */
+    private sentinel;
     constructor(ctx: Context, config?: GuardianService.Config);
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
@@ -69,6 +74,10 @@ export declare namespace GuardianService {
         scanSSRF?: boolean;
         /** 是否启用路径沙箱校验（默认 true） */
         checkPaths?: boolean;
+        /** 是否启用哨兵自防护引擎（默认 true） */
+        guardSelf?: boolean;
+        /** 追加纳入哨兵保护的资产路径（例如宿主自己的 hook 脚本） */
+        sentinelAssets?: string[];
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
     }
