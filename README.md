@@ -27,6 +27,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 外加：
 
+- **哨兵自防护引擎**（`sentinel.ts`，engine-25）：所有检测引擎都隐含"护栏自身还活着"这一公理——本引擎专守这个公理。"动词 × 护栏资产"目标矩阵（审计日志/插件目录/追加资产 × rm/truncate/`>`/chmod/ln -s /dev/null/npm uninstall/pkill/Edit/Write），删审计日志、改护栏源码、卸载插件、冻结日志权限（活着但失明）一律 deny；另收编 MITRE T1562/T1070 反取证命令族（系统日志销毁/截断/黑洞化、`auditctl -e 0`、清 shell 历史）为 FORENSIC 规则组走人工确认。`': >'` 重定向截断与 `ln -sf /dev/null` 黑洞化在 SigmaHQ 生态无现成规则。借鉴 anthropics/claude-code#11226（官方确认 hook 可被改自身绕过且未修复）、EDR killer 检测（Sigma T1562 规则族）、Sysdig JADEPUFFER
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 

@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { compileSentinelMatcher, resolveSentinelAssets, type SentinelAsset, type SentinelHit, type SentinelMatcher } from './sentinel.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,15 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export {
+  compileSentinelMatcher, resolveSentinelAssets, scanSentinel, FORENSIC_RULES,
+  type SentinelAsset, type SentinelHit, type SentinelMatcher, type SentinelOptions,
+} from './sentinel.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'sentinel'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,7 +50,8 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎：
+ *  0. sentinel —— 哨兵自防护：谁在动护栏自己（删审计日志/改源码/卸载/杀进程）+ 反取证
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
@@ -57,7 +63,10 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableSentinel: boolean
   private allowedRoots: string[]
+  /** 哨兵匹配器：护栏自防护（动词×护栏资产矩阵 + FORENSIC 反取证规则组） */
+  private sentinel: SentinelMatcher | null
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -65,9 +74,13 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableSentinel = config.guardSelf ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
+    this.sentinel = this.enableSentinel
+      ? compileSentinelMatcher(resolveSentinelAssets({ logFile: this.logFile, extra: config.sentinelAssets }))
+      : null
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
     ctx.effect(() => () => this.stream.end())
@@ -96,6 +109,16 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：哨兵自防护（先护自身再谈其他——所有引擎都隐含"护栏还活着"这一公理）
+    if (this.sentinel) {
+      const sentinelHits = this.sentinel.scan(toolName, text)
+      if (sentinelHits.length) {
+        const first = sentinelHits[0]
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: first.action }, text.slice(0, 300), 'sentinel')
+        if (hit) return hit
+      }
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -178,6 +201,10 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用哨兵自防护引擎（默认 true） */
+    guardSelf?: boolean
+    /** 追加纳入哨兵保护的资产路径（例如宿主自己的 hook 脚本） */
+    sentinelAssets?: string[]
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
