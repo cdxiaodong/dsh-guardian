@@ -27,6 +27,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 外加：
 
+- **参数结构走私守卫**（`args.ts`，engine-26）：既有引擎全扫"解析后的值的内容语义"，本引擎扫 JSON 参数的**结构**——重复键 parser differential（`{"path":"/safe","path":"/etc/passwd"}`，first-wins 校验器 vs last-wins 执行器）、原型污染键（`__proto__`/`constructor` 及 URI 编码/NFKC 变形）、同形字键名冒充（西里尔 а 冒充 a，UTS#39-lite 折叠比对）、非标数字字面量（NaN/Infinity）与 >2^53 整数静默舍入。手写零依赖 tokenizer 在 JSON.parse 固化 last-wins **之前**消费原始 payload——parse 之后重复键证据不可逆丢失，这是唯一卡位。借鉴 Bishop Fox JSON 互操作性研究、GHSA-737v-mqg7-c878（defu 原型污染）、MCP Go SDK GHSA-q382-vc8q-7jhj、claude-code#29489（confusable 绕过 permission 规则，未修复）
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 

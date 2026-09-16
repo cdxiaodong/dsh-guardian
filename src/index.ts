@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanArgs } from './args.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,15 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export {
+  scanArgs, SENSITIVE_PARAM_KEYS, CONFUSABLE_MAP, skeletonFold,
+  type ArgHit, type ArgAction, type ArgScanOptions,
+} from './args.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'args'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +50,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
- *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ * 四个检测引擎：
+ *  1. args   —— 参数结构走私（重复键/原型污染键/同形字键名/非标数字：消费原始
+ *     payload——JSON.stringify 会折叠重复键，parse 后结构证据不可逆丢失）
+ *  2. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
+ *  3. secret —— 密钥/凭据泄露（gitleaks 风格）
+ *  4. ssrf   —— 内网/元数据地址访问
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -57,6 +64,8 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableArgs: boolean
+  private argSensitiveKeys: string[]
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +74,8 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableArgs = config.scanArgs ?? true
+    this.argSensitiveKeys = config.argSensitiveKeys ?? []
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -97,7 +108,23 @@ export class GuardianService extends Service {
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
 
-    // 引擎 1：危险规则
+    // 引擎 1：参数结构走私（必须最先且消费原始 payload——text 已把重复键 last-wins
+    // 折叠、NaN 变 null、大数舍入，结构证据不可逆；先钉审计再谈内容语义）
+    if (this.enableArgs) {
+      const argHits = scanArgs(payload, { sensitiveKeys: this.argSensitiveKeys })
+      if (argHits.length) {
+        // deny 优先 + 全量透出：防「良性 block 诱饵排在前面掩埋 deny 走私」的键序
+        // 攻击（对抗审查实测：取 argHits[0] 时，approve 批准一条 NaN 即可洗白其后
+        // 的 __proto__ 污染）。deny 永不经 approve；block 审批时透出全部 ruleId。
+        const first = argHits.find((h) => h.action === 'deny') ?? argHits[0]
+        const rest = argHits.filter((h) => h !== first)
+        const extra = rest.length ? `（另检出 ${rest.map((h) => h.ruleId).join('、')}，共 ${argHits.length} 条）` : ''
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason + extra, action: first.action }, first.match.slice(0, 300), 'args')
+        if (hit) return hit
+      }
+    }
+
+    // 引擎 2：危险规则
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
       if (!rule.pattern.test(text)) continue
@@ -106,7 +133,7 @@ export class GuardianService extends Service {
       if (hit) return hit
     }
 
-    // 引擎 2：密钥泄露（deny 级，含明文密钥绝不放行）
+    // 引擎 3：密钥泄露（deny 级，含明文密钥绝不放行）
     if (this.enableSecret) {
       const secretHits = scanSecrets(text)
       if (secretHits.length) {
@@ -116,7 +143,7 @@ export class GuardianService extends Service {
       }
     }
 
-    // 引擎 3：SSRF / 内网访问（block 级，走人工确认）
+    // 引擎 4：SSRF / 内网访问（block 级，走人工确认）
     if (this.enableSSRF) {
       const ssrfHits = scanNetworkTarget(text)
       if (ssrfHits.length) {
@@ -178,6 +205,10 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用参数结构走私扫描（默认 true） */
+    scanArgs?: boolean
+    /** 追加的键名冒充敏感基线（小写；同形字折叠后命中即 block） */
+    argSensitiveKeys?: string[]
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
