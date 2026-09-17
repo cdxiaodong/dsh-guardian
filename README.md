@@ -27,6 +27,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 外加：
 
+- **技能投毒守卫**（`skills.ts`，engine-27）：盯 Agent harness 的「信任载入面」——skills/commands/agents 定义文件写入时人畜无害，载入时却以高权限进上下文甚至先于模型可见性执行。借鉴 Datadog《Dynamic Context》实证的 `!`+反引号载入时预执行标记（deny/block 双级）、Snyk ToxicSkills 的凭据源↔出网口同行配对与远程指令装载家族、SkillJect 的「payload 藏辅助脚本」artifact 通道（检测面=整棵技能目录树）、Reversec《Skill Issues》的链式后门传播；另设 frontmatter 元数据投毒（描述即上下文，零调用注入）与 shell 重定向绕过路径路由（SKL-012）双卡位
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
 
