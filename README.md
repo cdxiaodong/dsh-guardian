@@ -29,13 +29,15 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **工具结果消毒**（`guardian/result`）：工具返回值写入模型上下文前，就地剥除注入指令——数据通道与指令通道分离（CaMeL），消毒不拦截（llm-guard sanitize 模式），专检延迟引信（deferred trigger）与隐形载体
 
 ## 🚦 三级处置
 
 | 级别 | 行为 | 例子 |
 |---|---|---|
-| `deny` | 直接拒绝 | 反弹shell、mkfs、读 /etc/shadow、明文密钥 |
+| `deny` | 直接拒绝 | 反弹shell、mkfs、读 /etc/shadow、明文密钥、结果教唆外传 |
 | `block` | 需人工确认（走 `guardian/approve`） | rm -rf ~、读 .ssh、curl 上传文件 |
+| `redact` | 就地消毒后放行（工具结果通道） | 网页正文中的注入指令、延迟引信、隐形载体 |
 | `log` | 仅记录审计 | 路径穿越、读取 shell history |
 
 ## 📦 安装
@@ -70,6 +72,11 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
+// ③' 工具结果写入模型上下文前消毒（间接注入的主通道）
+const rv = ctx.bail('guardian/result', toolName, rawResult)
+if (rv && rv.safe === false) throw new Error(`结果被拒绝：${rv.reason}`)
+return rv ? rv.sanitized : rawResult   // 消毒后的数据继续流动
+
 // ④ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
@@ -82,11 +89,12 @@ console.log(ctx.guardian.readAudit(20))
 | 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
 | 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
 | 隔离机制 | 多实例可绑定独立配置/白名单 |
+| 事件通道复用（Composable Channels） | `guardian/path`、`guardian/result` 独立 bail 通道按需组合，宿主按数据流向各自接入 |
 
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 38/38 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -95,11 +103,12 @@ npm ci && npm test     # 19/19 通过
 
 - [gitleaks](https://github.com/gitleaks/gitleaks) — 密钥正则库 + 熵过滤
 - [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) — 密钥检测器设计
-- [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline 架构
+- [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline 架构 + Output Scanner sanitize 模式
 - [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [CaMeL（DeepMind）](https://arxiv.org/abs/2503.18820) — 数据通道与指令通道分离思想（`guardian/result` 的理论根基）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
