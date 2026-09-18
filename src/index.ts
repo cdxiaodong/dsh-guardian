@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { sanitizeToolResult, type ResultVerdict, type RemovedSpan } from './toolresult.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { sanitizeToolResult, TRP_RULES, revealTagChars, type ResultVerdict, type RemovedSpan, type TRPRule } from './toolresult.js'
 
 export interface AuditEntry {
   ts: string
-  level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  level: 'allow' | 'block' | 'deny' | 'redact'
+  engine: 'rule' | 'secret' | 'ssrf' | 'result'
   tool?: string
   ruleId?: string
   reason?: string
@@ -57,6 +59,7 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableResultSanitizer: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +68,7 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableResultSanitizer = config.sanitizeResults ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -82,6 +86,15 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 工具结果消毒通道：宿主在工具返回值写入模型上下文前调用（数据入上下文的最后一道闸）
+    // 用法：const v = ctx.bail('guardian/result', toolName, rawResult)
+    //      v.safe===false → 拒绝该结果；否则用 v.sanitized（已消毒）继续流动
+    if (this.enableResultSanitizer) {
+      ctx.on('guardian/result' as any, (toolName: string, result: unknown) => {
+        return this.sanitizeResult(toolName, result)
+      }, true)
+    }
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -89,6 +102,37 @@ export class GuardianService extends Service {
     const verdict = checkPath(target, this.allowedRoots)
     if (!verdict.safe) {
       this.audit({ level: 'deny', engine: 'rule', tool: 'fs', ruleId: 'PATH-SANDBOX', reason: verdict.reason, snippet: target.slice(0, 300) })
+    }
+    return verdict
+  }
+
+  /**
+   * 工具结果消毒：字符串结果就地剥除注入指令后放行（CaMeL 通道分离 +
+   * llm-guard sanitize 模式）；deny 级命中拒绝整条结果。
+   * 非字符串结果只扫描——无法安全改写嵌套结构，命中即拒绝。
+   */
+  sanitizeResult(toolName: string, result: unknown): ResultVerdict {
+    if (typeof result !== 'string') {
+      const text = JSON.stringify(result ?? {})
+      const verdict = sanitizeToolResult(text)
+      if (verdict.safe && verdict.removed.length) {
+        // 无法安全改写嵌套结构：含注入特征即拒绝整条结果
+        const first = verdict.removed[0]
+        this.audit({ level: 'deny', engine: 'result', tool: toolName, ruleId: first.ruleId, reason: `非字符串结果含注入特征，无法安全消毒：${first.reason}`, snippet: text.slice(0, 300) })
+        return { safe: false, ruleId: first.ruleId, reason: '非字符串结果含注入特征，无法安全消毒', sanitized: '', removed: verdict.removed }
+      }
+      if (!verdict.safe) {
+        this.audit({ level: 'deny', engine: 'result', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet: text.slice(0, 300) })
+      }
+      return verdict
+    }
+    const verdict = sanitizeToolResult(result)
+    if (!verdict.safe) {
+      this.audit({ level: 'deny', engine: 'result', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet: result.slice(0, 300) })
+      return verdict
+    }
+    for (const r of verdict.removed) {
+      this.audit({ level: 'redact', engine: 'result', tool: toolName, ruleId: r.ruleId, reason: r.reason, snippet: r.preview })
     }
     return verdict
   }
@@ -178,6 +222,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用工具结果消毒（默认 true）：数据写入模型上下文前剥除注入指令 */
+    sanitizeResults?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
