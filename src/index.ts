@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { DripTracker, type DripOptions, type DripVerdict } from './drip.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { DripTracker, DRP_RULES, DRP_DEFAULTS, OUTBOUND_PATTERN, DELAY_PATTERN, SENSITIVE_SOURCES, type DripOptions, type DripVerdict, type DripEvent } from './drip.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'drip'
   tool?: string
   ruleId?: string
   reason?: string
@@ -57,6 +59,8 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableDrip: boolean
+  private drip: DripTracker
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,12 +69,17 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableDrip = config.dripGuard ?? true
+    this.drip = new DripTracker(config.drip ?? {})
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
-    // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
-    ctx.effect(() => () => this.stream.end())
+    // 可逆效应：插件卸载时自动关闭文件流 + 清空行为账本（时空可组合-时间维度）
+    ctx.effect(() => () => {
+      this.stream.end()
+      this.drip.reset()
+    })
 
     // 护栏最先执行（prepend）
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
@@ -96,6 +105,12 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 4 前置记账：行为轨迹必须无条件入账——即使本次调用被下方静态引擎
+    // 拦截，攻击者"用被拦的调用试探而不留账"也不能得逞（慢速外泄的关键防线）
+    const dripHits: DripVerdict[] = this.enableDrip
+      ? this.drip.recordAndInspect(toolName, text)
+      : []
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -125,6 +140,13 @@ export class GuardianService extends Service {
         const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf')
         if (hit) return hit
       }
+    }
+
+    // 引擎 4：慢速外泄判定（静态全放行后，行为模式风险浮出水面）
+    if (dripHits.length) {
+      const first = dripHits[0]
+      const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: first.action }, text.slice(0, 300), 'drip')
+      if (hit) return hit
     }
 
     return false
@@ -178,6 +200,10 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用慢速外泄检测（默认 true） */
+    dripGuard?: boolean
+    /** 慢速外泄检测参数（窗口宽度/字节上限/streak 上限/心跳阈值等） */
+    drip?: DripOptions
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
