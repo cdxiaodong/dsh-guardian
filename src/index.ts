@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { BaselineTracker, type BaselineConfig } from './baseline.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { BaselineTracker, classifyTool, HIGH_RISK_CLASSES, BLD_RULES, DEFAULT_BASELINE_CONFIG, type BaselineConfig, type BaselineVerdict, type ToolClass, type ProfileSnapshot } from './baseline.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'baseline'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private enableBaseline: boolean
+  private tracker: BaselineTracker
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +70,8 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableBaseline = config.trackBaseline ?? true
+    this.tracker = new BaselineTracker(config.baseline ?? {})
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -97,6 +103,9 @@ export class GuardianService extends Service {
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
 
+    // 引擎 0（记账）：行为账本无条件先于一切判定——被拦截的调用同样是行为证据
+    if (this.enableBaseline) this.tracker.record(toolName, text)
+
     // 引擎 1：危险规则
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
@@ -123,6 +132,15 @@ export class GuardianService extends Service {
         const first = ssrfHits[0]
         const snippet = text.slice(0, 300)
         const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf')
+        if (hit) return hit
+      }
+    }
+
+    // 引擎 4：行为基线偏离（时间维度兜底，单次检查全放行时仍能拦习惯漂移）
+    if (this.enableBaseline) {
+      const verdict = this.tracker.assess(toolName, text)
+      if (!verdict.safe) {
+        const hit = this.handleRule(toolName, { id: verdict.ruleId!, reason: verdict.reason!, action: verdict.action ?? 'block' }, text.slice(0, 300), 'baseline')
         if (hit) return hit
       }
     }
@@ -166,6 +184,11 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 当前会话行为画像快照（遥测/展示用） */
+  baselineSnapshot() { return this.tracker.snapshot() }
+  /** 重建行为基线：人工确认"任务进入新阶段"后调用 */
+  resetBaseline() { this.tracker.reset() }
 }
 
 export namespace GuardianService {
@@ -180,6 +203,10 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用行为基线偏离检测（默认 true） */
+    trackBaseline?: boolean
+    /** 行为基线引擎调参（阈值/窗口等，见 BaselineConfig） */
+    baseline?: BaselineConfig
   }
 }
 
