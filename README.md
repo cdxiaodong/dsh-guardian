@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **行为基线偏离引擎**（`baseline.ts`）：会话前 N 次调用建立行为画像（工具类别分布/参数规模/调用节奏），之后盯"这个会话还像不像它自己"——权限扩张（BLD-001）、参数膨胀（BLD-002）、工具风暴侦察（BLD-003）、失控循环（BLD-004）、复读机（BLD-005）。借鉴 Google Agent Anomaly Detection 与 UEBA 方法论；账本记账无条件先于判定，冷启动不误报，人工批准的类别自动成为习惯
 
 ## 🚦 三级处置
 
@@ -54,6 +55,8 @@ const ctx = new Context()
 ctx.plugin(guardian, {
   allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
   scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  trackBaseline: true,                      // 行为基线偏离检测（默认开）
+  baseline: { minCalls: 8 },                // 基线调参（阈值/窗口）
 })
 
 // ① 接入人工批准（无此监听器时 block 级默认拒绝）
@@ -70,8 +73,10 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 查审计日志 + 行为画像
 console.log(ctx.guardian.readAudit(20))
+console.log(ctx.guardian.baselineSnapshot())   // { calls, highRiskShare, medianArgLen, ... }
+ctx.guardian.resetBaseline()                   // 人工确认"任务进入新阶段"后重建基线
 ```
 
 ## 🔧 对应论文机制
@@ -81,7 +86,8 @@ console.log(ctx.guardian.readAudit(20))
 | 响应式协效应（provide/inject） | `provide=['guardian']` 对外提供服务；依赖 cordis 事件系统 |
 | 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
 | 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
-| 隔离机制 | 多实例可绑定独立配置/白名单 |
+| 隔离机制 | 多实例可绑定独立配置/白名单；BaselineTracker 会话账本随实例隔离 |
+| 时间维度 | 行为基线账本把单次检查扩展为会话时间线：`record()` 无条件记账先于判定，插件卸载账本随实例消亡零残留 |
 
 ## 🧪 测试
 
