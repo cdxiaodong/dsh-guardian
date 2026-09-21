@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { BudgetTracker, type BudgetVerdict, type BudgetStats } from './budget.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { BudgetTracker, type BudgetVerdict, type BudgetStats } from './budget.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'budget'
   tool?: string
   ruleId?: string
   reason?: string
@@ -30,6 +32,8 @@ export interface Interception {
   ruleId: string
   action: Rule['action']
   engine: AuditEntry['engine']
+  /** 预算熔断时附带预算读数（BUD-001~003） */
+  budget?: BudgetStats
 }
 
 declare module 'cordis' {
@@ -57,7 +61,9 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableBudget: boolean
   private allowedRoots: string[]
+  private budget: BudgetTracker
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -65,7 +71,13 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableBudget = config.suppressBursts ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.budget = new BudgetTracker({
+      windowMs: config.budgetWindowMs,
+      maxCalls: config.budgetMaxCalls,
+      maxBytes: config.budgetMaxBytes,
+    })
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -96,6 +108,16 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 0：突发抑制（预算熔断，最先执行——护栏不可用则一切免谈）
+    // 记账无条件：本次调用先入账（含字节），再判定是否已触顶
+    if (this.enableBudget) {
+      const verdict = this.budget.record(toolName, text)
+      if (verdict.tripped) {
+        this.audit({ level: 'deny', engine: 'budget', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet: text.slice(0, 300) })
+        return { intercepted: true, reason: verdict.reason, ruleId: verdict.ruleId, action: 'deny', engine: 'budget', budget: verdict.stats }
+      }
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -166,6 +188,12 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 预算遥测快照（宿主监控护栏自身余量用） */
+  budgetSnapshot() { return this.budget.snapshot() }
+
+  /** 重置预算账本（人工确认"任务新阶段"后手动恢复余量） */
+  resetBudget() { this.budget.reset() }
 }
 
 export namespace GuardianService {
@@ -180,6 +208,14 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用突发抑制/预算熔断（默认 true） */
+    suppressBursts?: boolean
+    /** 预算滑动窗口宽度 ms（默认 5000） */
+    budgetWindowMs?: number
+    /** 窗口内调用数上限（默认 30） */
+    budgetMaxCalls?: number
+    /** 窗口内 payload 字节上限（默认 262144 = 256KB） */
+    budgetMaxBytes?: number
   }
 }
 
