@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **突发抑制引擎**（`budget.ts`）：预算熔断守卫护栏自身可用性——滑动窗口调用数/字节预算 + 冲刺-静默振荡检测。回应 arXiv:2606.14517《From Shield to Target》：攻击者可用构造载荷让护栏陷入长推理循环（148× 延迟放大）耗尽共享资源；预算随窗口滑出**自动愈合**，无永久拉黑
 
 ## 🚦 三级处置
 
@@ -54,6 +55,8 @@ const ctx = new Context()
 ctx.plugin(guardian, {
   allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
   scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  budgetMaxCalls: 30,                       // 可选：5s 窗口调用数预算（默认 30）
+  budgetMaxBytes: 262144,                   // 可选：5s 窗口字节预算（默认 256KB）
 })
 
 // ① 接入人工批准（无此监听器时 block 级默认拒绝）
