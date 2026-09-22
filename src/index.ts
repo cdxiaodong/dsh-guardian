@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { TamperEvidence, verifyChain, GENESIS_HASH, computeRecordHash, canonicalizeEvent, type ChainEntry, type ChainHead, type VerifyResult } from './chain.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,6 +14,7 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { TamperEvidence, verifyChain, GENESIS_HASH, computeRecordHash, canonicalizeEvent, type ChainEntry, type ChainHead, type VerifyResult } from './chain.js'
 
 export interface AuditEntry {
   ts: string
@@ -58,6 +60,22 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 防篡改模式开关：审计串接哈希链 */
+  readonly tamperEvidence: boolean
+  /** 链式写入器（tamperEvidence=false 时为 null） */
+  private chain: TamperEvidence | null
+
+  /** 初始化链写入器：磁盘已有合法链 → 从链尾续写（跨进程持久）；否则新链 */
+  private initChain(): TamperEvidence {
+    let head: ChainHead | undefined
+    if (fs.existsSync(this.logFile)) {
+      const lines = fs.readFileSync(this.logFile, 'utf8').trim().split('\n').filter(Boolean)
+      const res = verifyChain(lines)
+      if (res.ok && res.head && res.head.seq > 0) head = res.head
+      // 验证失败 → 从新链重开（旧文件已被篡改，保留现场由宿主处置）
+    }
+    return new TamperEvidence(this.logFile, head)
+  }
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -67,6 +85,12 @@ export class GuardianService extends Service {
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
+    // 防篡改模式：审计日志串接哈希链（tamper-evidence chain）
+    // 注意 append 模式：initChain 已读磁盘验证旧链，从链尾续写；验链失败则从创世重开（先 truncate 清掉坏链）
+    this.tamperEvidence = config.tamperEvidence ?? false
+    this.chain = this.tamperEvidence ? this.initChain() : null
+    const startFresh = this.tamperEvidence && this.chain && this.chain.chainHead().seq === 0
+    if (startFresh && fs.existsSync(this.logFile)) fs.writeFileSync(this.logFile, '')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
@@ -153,19 +177,64 @@ export class GuardianService extends Service {
 
   audit(entry: Omit<AuditEntry, 'ts'>) {
     const full: AuditEntry = { ts: new Date().toISOString(), ...entry }
-    this.stream.write(JSON.stringify(full) + '\n')
+    if (this.chain) {
+      // 链式模式：事件先 canonical 序列化再串链，写盘的是含链字段的 JSON 行
+      this.stream.write(this.chain.append(full as unknown as Record<string, unknown>) + '\n')
+    } else {
+      this.stream.write(JSON.stringify(full) + '\n')
+    }
+  }
+
+  /** 验证审计日志完整性：链模式查哈希链；普通模式查 JSON 可解析性 */
+  verifyAudit(): VerifyResult & { mode: 'chain' | 'plain' } {
+    const lines = this.readAuditLines()
+    if (this.chain) {
+      const res = this.chain.checkAgainstDisk(() => lines)
+      return { ...res, mode: 'chain' }
+    }
+    // 普通模式兜底：至少能解析出所有行（无防篡改保证，只防意外损坏）
+    for (let i = 0; i < lines.length; i++) {
+      try { JSON.parse(lines[i]) } catch { return { ok: false, problem: 'parse', line: i + 1, verifiedCount: i, head: null, lastGood: null, mode: 'plain' } }
+    }
+    return { ok: true, problem: null, line: 0, verifiedCount: lines.length, head: null, lastGood: null, mode: 'plain' }
+  }
+
+  /** 读取审计链头（普通模式返回 null）——供宿主外部备份 / 告警联动 */
+  auditChainHead(): ChainHead | null {
+    return this.chain ? this.chain.chainHead() : null
+  }
+
+  private readAuditLines(): string[] {
+    if (!fs.existsSync(this.logFile)) return []
+    return fs.readFileSync(this.logFile, 'utf8').trim().split('\n').filter(Boolean)
   }
 
   readAudit(limit = 20): AuditEntry[] {
-    if (!fs.existsSync(this.logFile)) return []
-    const lines = fs.readFileSync(this.logFile, 'utf8').trim().split('\n').filter(Boolean)
-    return lines.slice(-limit)
-      .map((l) => { try { return JSON.parse(l) } catch { return null } })
+    return this.readAuditLines()
+      .slice(-limit)
+      .map((l) => {
+        try {
+          const rec = JSON.parse(l)
+          // 链模式：还原出业务事件（entry 字段）；普通模式：整行即事件
+          return rec && typeof rec.entry === 'string' ? parseCanonicalEntry(rec.entry) : rec
+        } catch { return null }
+      })
       .filter(Boolean) as AuditEntry[]
   }
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+}
+
+/** 链模式 entry 是 canonical（\u0001 分隔的 k=v）格式，还原成对象 */
+function parseCanonicalEntry(entry: string): AuditEntry | null {
+  const out: Record<string, string> = {}
+  for (const part of entry.split('\u0001')) {
+    const eq = part.indexOf('=')
+    if (eq === -1) return null
+    out[part.slice(0, eq)] = part.slice(eq + 1)
+  }
+  return out as unknown as AuditEntry
 }
 
 export namespace GuardianService {
@@ -180,6 +249,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 审计日志防篡改哈希链：每条记录串接前条哈希，事后篡改可离线检出（默认 false） */
+    tamperEvidence?: boolean
   }
 }
 
