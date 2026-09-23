@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanExplosive, extractTriggerWord, type TriggerVerdict } from './explosive.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,18 +14,17 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scanExplosive, extractTriggerWord, type TriggerVerdict } from './explosive.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'explosive'
   tool?: string
   ruleId?: string
   reason?: string
   snippet?: string
-}
-
-export interface Interception {
+}export interface Interception {
   intercepted: true
   reason: string
   ruleId: string
@@ -57,6 +57,7 @@ export class GuardianService extends Service {
   private enableSecret: boolean
   private enableSSRF: boolean
   private enablePath: boolean
+  private enableExplosive: boolean
   private allowedRoots: string[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
@@ -65,6 +66,7 @@ export class GuardianService extends Service {
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
+    this.enableExplosive = config.detectExplosivePrompts ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
@@ -127,6 +129,20 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 4：触发式提示炸弹（explosive prompt / 休眠条件载荷，deny 级）
+    // 调研 arXiv:2609.22510：裸祈使句模型几乎全拒，但重写成
+    // "if X then <状态改变动作>" 的休眠条件仍驱动真实工具执行（16.5% vs 2.4%）。
+    // 关键：payload 在 ingestion 时完全无害（没有裸指令），只有触发词出现才引爆，
+    // 所以盯"结构"（条件从句 + then + 状态改变动词）而非盯"语义"。
+    if (this.enableExplosive) {
+      const trigger = scanExplosive(text)
+      if (trigger.hit) {
+        const triggerWord = extractTriggerWord(text) ?? trigger.trigger
+        this.audit({ level: 'deny', engine: 'explosive', tool: toolName, ruleId: 'EXPL-001', reason: trigger.reason, snippet: trigger.snippet })
+        return { intercepted: true, reason: `触发式提示炸弹（休眠条件载荷，触发词: "${triggerWord}"）：${trigger.reason}`, ruleId: 'EXPL-001', action: 'deny', engine: 'explosive' }
+      }
+    }
+
     return false
   }
 
@@ -178,6 +194,8 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用触发式提示炸弹检测（默认 true） */
+    detectExplosivePrompts?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
