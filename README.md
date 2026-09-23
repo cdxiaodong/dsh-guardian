@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 六大检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,17 +24,19 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **EXPL** 触发式提示炸弹 | 休眠条件载荷："If/When/Once + 触发词 → then + 状态改变动词" 的条件武器化结构 | arXiv:2609.22510 DeFuse |
 
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **触发式提示炸弹检测**（`explosive.ts`）：审查摄入内容中"休眠待引爆"的条件载荷。普通间接注入接触即发、易被现有规则命中；爆炸提示平时完全无害，只有攻击者指定的触发词出现才引爆（论文实测 9 个生产 agent 命中 43-83%）。本引擎在 ingestion 时检查**条件结构**（条件从句 → then 分支 → 状态改变动词）并提取触发词，`detectExplosivePrompts: false` 可关停
 
 ## 🚦 三级处置
 
 | 级别 | 行为 | 例子 |
 |---|---|---|
-| `deny` | 直接拒绝 | 反弹shell、mkfs、读 /etc/shadow、明文密钥 |
+| `deny` | 直接拒绝 | 反弹shell、mkfs、读 /etc/shadow、明文密钥、触发式提示炸弹 |
 | `block` | 需人工确认（走 `guardian/approve`） | rm -rf ~、读 .ssh、curl 上传文件 |
 | `log` | 仅记录审计 | 路径穿越、读取 shell history |
 
@@ -86,7 +88,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 26/26 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +102,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [Defusing Explosive Prompts (arXiv:2609.22510)](https://arxiv.org/abs/2609.22510) — 触发式提示炸弹（休眠条件载荷）威胁模型与 ingestion-time 检测杠杆（DeFuse）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
