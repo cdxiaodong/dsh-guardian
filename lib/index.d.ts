@@ -1,15 +1,17 @@
 import { Context, Service } from 'cordis';
 import { DEFAULT_RULES, type Rule } from './rules.js';
+import { type EscrowConfig, type EscrowVerdict } from './escrow.js';
 export declare const name = "dsh-guardian";
 export { DEFAULT_RULES, type Rule };
 export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './secrets.js';
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js';
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js';
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js';
+export { createEscrowTracker, probeSensitive, fnv1a64, bitsOf, type EscrowTracker, type EscrowConfig, type EscrowVerdict, type EscrowEntry } from './escrow.js';
 export interface AuditEntry {
     ts: string;
     level: 'allow' | 'block' | 'deny';
-    engine: 'rule' | 'secret' | 'ssrf';
+    engine: 'rule' | 'secret' | 'ssrf' | 'escrow';
     tool?: string;
     ruleId?: string;
     reason?: string;
@@ -47,9 +49,17 @@ export declare class GuardianService extends Service {
     private enableSSRF;
     private enablePath;
     private allowedRoots;
+    private enableEscrow;
+    private escrowTracker;
     constructor(ctx: Context, config?: GuardianService.Config);
     /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
+    /**
+     * 出境滞留判定（engine：escrow）。
+     * ESC-001 hold → 走 guardian/approve 人工确认（批准可过但账已入）；
+     * ESC-002 deny → 配额耗尽直接拒，批准也无法过（速率维度）。
+     */
+    checkEgressEscrow(toolName: string, payload: unknown): EscrowVerdict;
     /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
     check(toolName: string, payload: unknown): Interception | false;
     /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
@@ -71,6 +81,10 @@ export declare namespace GuardianService {
         checkPaths?: boolean;
         /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
         allowedRoots?: string[];
+        /** 是否启出境滞留引擎（默认 true） */
+        checkEgressEscrow?: boolean;
+        /** 出境滞留引擎配置（窗口/比特预算） */
+        escrow?: EscrowConfig;
     }
 }
 export declare const provide: string[];

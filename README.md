@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **出境滞留引擎**（`guardian/escrow`）：敏感外呼先"押货"再放行——窗口内去重比特配额 + 滞留账可撤销，时间维度可撤销出境
 
 ## 🚦 三级处置
 
@@ -70,7 +71,11 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 出境外呼前走滞留闸门（敏感内容先扣押观察，配额耗尽直接拒）
+const e = ctx.bail('guardian/escrow', toolName, outboundPayload)
+if (e && e.intercepted) throw new Error(`出境被扣押：${e.reason}`)
+
+// ⑤ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
@@ -86,7 +91,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 32/32 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +105,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- Provisional Reachability（arXiv:2609.18741, 2026）— 出境滞留引擎的 escrow/audit/revoke 机制与"bits per period"量化思想
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
