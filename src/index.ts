@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { createEscrowTracker, type EscrowTracker, type EscrowConfig, type EscrowVerdict, probeSensitive } from './escrow.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { createEscrowTracker, probeSensitive, fnv1a64, bitsOf, type EscrowTracker, type EscrowConfig, type EscrowVerdict, type EscrowEntry } from './escrow.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'escrow'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private enableEscrow: boolean
+  private escrowTracker: EscrowTracker
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +70,8 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableEscrow = config.checkEgressEscrow ?? true
+    this.escrowTracker = createEscrowTracker(config.escrow ?? {})
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -82,6 +88,13 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 出境滞留通道：宿主在外呼（网络发送/上传）前调用
+    // 用法：const v = ctx.bail('guardian/escrow', tool, payload)；v.intercepted 即拦截
+    ctx.on('guardian/escrow' as any, (toolName: string, payload: unknown) => {
+      if (!this.enableEscrow) return false
+      return this.checkEgressEscrow(toolName, payload)
+    }, true)
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -89,6 +102,32 @@ export class GuardianService extends Service {
     const verdict = checkPath(target, this.allowedRoots)
     if (!verdict.safe) {
       this.audit({ level: 'deny', engine: 'rule', tool: 'fs', ruleId: 'PATH-SANDBOX', reason: verdict.reason, snippet: target.slice(0, 300) })
+    }
+    return verdict
+  }
+
+  /**
+   * 出境滞留判定（engine：escrow）。
+   * ESC-001 hold → 走 guardian/approve 人工确认（批准可过但账已入）；
+   * ESC-002 deny → 配额耗尽直接拒，批准也无法过（速率维度）。
+   */
+  checkEgressEscrow(toolName: string, payload: unknown): EscrowVerdict {
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+    const verdict = this.escrowTracker.record(toolName, text)
+    if (!verdict.intercepted) return verdict
+
+    if (verdict.ruleId === 'ESC-002') {
+      // 配额耗尽：deny，批准不可过（记账已无条件完成）
+      this.audit({ level: 'deny', engine: 'escrow', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason })
+      return verdict
+    }
+
+    // ESC-001：hold，走人工确认
+    this.audit({ level: 'block', engine: 'escrow', tool: toolName, ruleId: verdict.ruleId ?? 'ESC-001', reason: verdict.reason })
+    const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason } as any)
+    const approved = typeof res === 'object' && res !== null && (res as any).approved === true
+    if (approved) {
+      return { ...verdict, intercepted: false, reason: `${verdict.reason}（已批准放行，滞留账保留 ${verdict.heldBits} bits 观察中）` }
     }
     return verdict
   }
@@ -180,6 +219,10 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启出境滞留引擎（默认 true） */
+    checkEgressEscrow?: boolean
+    /** 出境滞留引擎配置（窗口/比特预算） */
+    escrow?: EscrowConfig
   }
 }
 
