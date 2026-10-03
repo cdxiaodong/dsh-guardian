@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **围栏试探检测**（`fence-probing.ts`）：被拒调用的相似变体重试 / 变体枚举 / 工具监狱（fail2ban 式冷却，指数递增封顶）。攻击者被拒后微调命令骗过静态正则，唯一暴露的是与"被拒历史"的时序-语义关联——deny 后紧跟高相似重试＝绕过意图。借鉴 fail2ban jail、《Covert Assistance》(arXiv 2026-09-30)、EvasionBench 监控规避
 
 ## 🚦 三级处置
 
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 30/30 通过
 ```
 
 ## 🙏 致谢 / 参考
