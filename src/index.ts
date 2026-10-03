@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { FenceProbingTracker, DEFAULT_PROBING_OPTIONS, type FenceProbingOptions } from './fence-probing.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { FenceProbingTracker, tokenizeCall, jaccardSimilarity, DEFAULT_PROBING_OPTIONS, type FenceProbingOptions, type ProbingVerdict, type JailState } from './fence-probing.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'probing'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,12 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 检测引擎：
+ *  0. probing —— 围栏试探：被拒调用的相似变体重试 / 变体枚举 / 工具监狱（fail2ban）
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. path   —— 路径沙箱（guardian/path 独立通道）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +62,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private enableProbing: boolean
+  private probing: FenceProbingTracker
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +72,8 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableProbing = config.detectProbing ?? true
+    this.probing = new FenceProbingTracker({ ...DEFAULT_PROBING_OPTIONS, ...(config.probing ?? {}) })
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -97,6 +105,30 @@ export class GuardianService extends Service {
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
 
+    // 引擎 0：围栏试探（fence probing）——被拒调用的相似变体重试 / 变体枚举 / 工具监狱。
+    // block 级：人工确认可越过；批准＝放行且不入账（批准不是拒绝），继续静态引擎判定
+    if (this.enableProbing) {
+      const verdict = this.probing.assess(toolName, text, Date.now())
+      if (verdict) {
+        const snippet = text.slice(0, 300)
+        const approved = this.askApprove(toolName, { id: verdict.ruleId, reason: verdict.reason, action: 'block' }, snippet)
+        if (!approved) {
+          this.probing.record(toolName, text, Date.now())   // 记账无条件：本引擎的拦截也入账（监狱期尝试会续期）
+          this.audit({ level: 'block', engine: 'probing', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet })
+          return { intercepted: true, reason: `${verdict.reason}（未获批准）`, ruleId: verdict.ruleId, action: 'block', engine: 'probing' }
+        }
+        // 人工批准 → 视为未命中，落入静态引擎继续判定
+      }
+    }
+
+    const hit = this.checkStatic(toolName, payload, text)
+    // 记账无条件先于判定之后：任何拦截（deny / 未获批准的 block）都入账；批准的不入账
+    if (hit && this.enableProbing) this.probing.record(toolName, text, Date.now())
+    return hit
+  }
+
+  /** 静态引擎序列（rule → secret → ssrf）。返回 Interception=拦截；false=放行 */
+  private checkStatic(toolName: string, payload: unknown, text: string): Interception | false {
     // 引擎 1：危险规则
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
@@ -130,6 +162,17 @@ export class GuardianService extends Service {
     return false
   }
 
+  /** 人工确认通道：宿主提供 'guardian/approve' 监听器，约定返回 { approved: boolean } */
+  private askApprove(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string): boolean {
+    const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
+    return typeof res === 'object' && res !== null && (res as any).approved === true
+  }
+
+  /** 围栏试探账本快照（可观测性）：被拒记录数、各工具计数、活跃监狱 */
+  fenceStats(): { records: number; byTool: Record<string, number>; jails: { tool: string; until: number; strikes: number }[] } {
+    return this.probing.stats(Date.now())
+  }
+
   /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
   private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine']): Interception | false {
     if (rule.action === 'deny') {
@@ -138,9 +181,7 @@ export class GuardianService extends Service {
     }
     if (rule.action === 'block') {
       this.audit({ level: 'block', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
-      // 宿主提供 'guardian/approve' 监听器做人工确认，约定返回 { approved: boolean }
-      const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
-      const approved = typeof res === 'object' && res !== null && (res as any).approved === true
+      const approved = this.askApprove(toolName, rule, snippet)
       if (!approved) {
         return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine }
       }
@@ -178,6 +219,10 @@ export namespace GuardianService {
     scanSSRF?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
+    /** 是否启用围栏试探检测（默认 true） */
+    detectProbing?: boolean
+    /** 围栏试探引擎调参（窗口/相似度阈值/变体数/监狱阈值与时长的部分覆盖） */
+    probing?: Partial<FenceProbingOptions>
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
   }
