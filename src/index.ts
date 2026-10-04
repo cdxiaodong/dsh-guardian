@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanCourier } from './courier.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { scanCourier, extractCargoZones, decodeCandidates, COURIER_RULES, COURIER_THRESHOLDS, type CourierHit, type CargoZone, type CourierZoneKind } from './courier.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'courier'
   tool?: string
   ruleId?: string
   reason?: string
@@ -56,6 +58,7 @@ export class GuardianService extends Service {
   private rules: Rule[]
   private enableSecret: boolean
   private enableSSRF: boolean
+  private enableCourier: boolean
   private enablePath: boolean
   private allowedRoots: string[]
 
@@ -64,6 +67,7 @@ export class GuardianService extends Service {
     this.rules = [...DEFAULT_RULES, ...(config.rules ?? [])]
     this.enableSecret = config.scanSecrets ?? true
     this.enableSSRF = config.scanSSRF ?? true
+    this.enableCourier = config.scanCourier ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
@@ -127,6 +131,20 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 4：无辜信使 / URL 载货扫描（deny + block 级）。
+    // LLMLeak 隐蔽外泄：密钥 base64/hex/percent 编码进 URL 载区，借合法网页抓取出网——
+    // ssrf 盯目的地，本引擎盯货物。snippet 只放脱敏串，审计日志不落完整嫌疑载荷。
+    if (this.enableCourier) {
+      const courierHits = scanCourier(text)
+      if (courierHits.length) {
+        const first = courierHits[0]
+        const action: Rule['action'] = first.ruleId === 'CRX-002' ? 'block' : 'deny'
+        const snippet = `${first.where}｜carrier=${first.carrierMasked}${first.decodedPreview ? `｜decoded≈${first.decodedPreview}` : ''}`
+        const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action }, snippet, 'courier')
+        if (hit) return hit
+      }
+    }
+
     return false
   }
 
@@ -176,6 +194,8 @@ export namespace GuardianService {
     scanSecrets?: boolean
     /** 是否启用 SSRF/内网访问扫描（默认 true） */
     scanSSRF?: boolean
+    /** 是否启用 URL 载货扫描（无辜信使/LLMLeak 隐蔽外泄检测，默认 true） */
+    scanCourier?: boolean
     /** 是否启用路径沙箱校验（默认 true） */
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
