@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { DutyLedger, DEFAULT_DUTY_DEFS, EGRESS_SHAPE, EGRESS_TOOL, type DutyDef, type DutyRecord, type DutyView } from './duty.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { DutyLedger, DEFAULT_DUTY_DEFS, EGRESS_SHAPE, EGRESS_TOOL, pathMatchesArtifact, type DutyDef, type DutyRecord, type DutyView } from './duty.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'duty'
   tool?: string
   ruleId?: string
   reason?: string
@@ -45,10 +47,11 @@ declare module 'cordis' {
  *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
  *  - 返回 false → 放行
  *
- * 三个检测引擎：
+ * 四个检测引擎：
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *  4. duty   —— 义务账本（获取敏感残留 → 期限内必须清理，逾期冻结出境）
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +61,10 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private enableDuties: boolean
+  private dutyDefs: DutyDef[]
+  private dutyClock: () => number
+  private ledger: DutyLedger
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +73,10 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableDuties = config.enforceDuties ?? true
+    this.dutyDefs = [...DEFAULT_DUTY_DEFS, ...(config.dutyDefs ?? [])]
+    this.dutyClock = config.dutyClock ?? (() => Date.now())
+    this.ledger = new DutyLedger(this.dutyDefs, this.dutyClock)
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -127,7 +138,53 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 4：义务账本（acquire → F[0,d] dispose 的有界最终性义务 + 逾期遏制）
+    if (this.enableDuties) {
+      const hit = this.runDutyEngine(toolName, text)
+      if (hit) return hit
+    }
+
     return false
+  }
+
+  /**
+   * 义务账本引擎：三段式判定。
+   *  1) 销账优先——补救动作（清理残留）永远先于遏制执行，不能把"赎罪之路"堵死
+   *  2) 违约遏制——存在逾期未清义务时冻结出境通道（deny），但本地操作不受影响
+   *  3) 获取记账——产生敏感残留的调用本身放行，代价是背上期限义务
+   */
+  private runDutyEngine(toolName: string, text: string): Interception | false {
+    const now = this.dutyClock()
+
+    // 1) 销账扫描（须在任何遏制判定之前）
+    for (const rec of this.ledger.settleFrom(text)) {
+      this.audit({ level: 'allow', engine: 'duty', tool: toolName, ruleId: rec.defId, reason: `义务已履行：清理 ${rec.binding}`, snippet: text.slice(0, 300) })
+    }
+
+    // 2) 违约遏制：逾期未清 → 冻结出境
+    const overdue = this.ledger.overdue(now)
+    if (overdue.length && (EGRESS_SHAPE.test(text) || EGRESS_TOOL.test(toolName))) {
+      const worst = overdue[overdue.length - 1]
+      this.audit({ level: 'deny', engine: 'duty', tool: toolName, ruleId: 'DUTY-900', reason: `存在 ${overdue.length} 条逾期未清理的敏感残留义务（如 ${worst.binding}），出境通道已冻结直至销账`, snippet: text.slice(0, 300) })
+      return { intercepted: true, reason: `敏感残留清理义务逾期（${overdue.length} 条，最早涉及 ${worst.binding}），已冻结出境通道；请先清理残留再外传数据`, ruleId: 'DUTY-900', action: 'deny', engine: 'duty' }
+    }
+
+    // 3) 获取记账（不拦截：义务是获取的代价，不是禁令）
+    for (const rec of this.ledger.recordFrom(text)) {
+      this.audit({ level: 'allow', engine: 'duty', tool: toolName, ruleId: rec.defId, reason: `产生清理义务：${rec.binding} 须在 ${Math.round((rec.deadlineAt - rec.acquiredAt) / 1000)}s 内清理`, snippet: text.slice(0, 300) })
+    }
+
+    return false
+  }
+
+  /** 未清义务清单（含 overdue 计算位），宿主可在会话收尾前检查"未尽事项" */
+  pendingDuties(): DutyView[] {
+    return this.ledger.open(this.dutyClock())
+  }
+
+  /** 人工销账：宿主在带外完成清理后手动清偿义务 */
+  fulfillDuty(defId: string, binding?: string): DutyRecord[] {
+    return this.ledger.manualFulfill(defId, binding)
   }
 
   /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
@@ -180,6 +237,12 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用义务账本引擎（默认 true） */
+    enforceDuties?: boolean
+    /** 追加自定义义务定义（signal→artifact→dispose + 期限） */
+    dutyDefs?: DutyDef[]
+    /** 义务账本时钟注入（默认真实时钟；测试/宿主可时间旅行） */
+    dutyClock?: () => number
   }
 }
 

@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 六大检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,11 +24,22 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **DUTY** 义务账本 | env/history 落盘、密钥材料备份到临时区 → 期限内必须清理，逾期冻结出境（DUTY-900） | EnfFlash（arXiv:2610.04611）MFOTL 义务片段 |
 
 外加：
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+
+### 义务账本（Duty Ledger）：禁止之外的第一类防线
+
+现有引擎全是**禁止型**（"不许做 X"）；义务账本是**义务型**（"做了 X 就必须在期限 d 内做 Y"）——
+`G ( signal(x) → F[0,d] dispose(x) )` 的确定性本地实现：
+
+- **获取记账**：`printenv > /tmp/env.txt`、`cp server.pem /tmp/x.bak`、`tar -czf /tmp/b.tgz ~/.ssh` 这类"静态引擎放行、但敏感材料已物化成残留工件"的调用，本身放行，代价是背上一条带期限的清理义务
+- **一阶关联**：获取与销账通过工件路径绑定（`rm /tmp/other` 清错对象不销账，支持 `rm /tmp/env*` glob 与目录前缀）
+- **逾期遏制**：期限（默认 10 分钟）过了还没清理 → 冻结一切出境调用（DUTY-900 deny），本地操作不受影响，补救动作永远优先放行
+- **宿主 API**：`pendingDuties()` 会话收尾前查"未尽事项"，`fulfillDuty()` 带外清理后人工销账
 
 ## 🚦 三级处置
 
@@ -54,6 +65,7 @@ const ctx = new Context()
 ctx.plugin(guardian, {
   allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
   scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  enforceDuties: true,                      // 义务账本引擎（可追加 dutyDefs 自定义义务）
 })
 
 // ① 接入人工批准（无此监听器时 block 级默认拒绝）
@@ -72,6 +84,11 @@ if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
 // ④ 查审计日志
 console.log(ctx.guardian.readAudit(20))
+
+// ⑤ 会话收尾前查未尽义务（敏感残留是否都已清理）
+for (const d of ctx.guardian.pendingDuties()) {
+  console.warn(`[${d.overdue ? '已逾期' : '未到期'}] ${d.defId}: ${d.binding}`)
+}
 ```
 
 ## 🔧 对应论文机制
@@ -86,7 +103,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 31/31 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +117,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [EnfFlash / arXiv:2610.04611](http://arxiv.org/abs/2610.04611) — MFOTL 一阶量时序逻辑的运行时强制执行（义务账本引擎的时序-语义来源）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
