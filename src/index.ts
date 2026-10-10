@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { SkillLedger, extractSkillWrite, profileSkill, judgeSkillEvolution, SKILL_PATH_PATTERN } from './skill-evolution.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { profileSkill, judgeSkillEvolution, hashContent, SkillLedger, extractSkillWrite, SKILL_PATH_PATTERN, type SkillProfile, type SkillVersion, type SkillVerdict } from './skill-evolution.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'skill'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,9 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private skillLedger: SkillLedger
+  private guardSkills: boolean
+  private skillPatterns: RegExp[]
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +71,9 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.guardSkills = config.guardSkills ?? true
+    this.skillPatterns = (config.skillPatterns ?? []).map((src) => new RegExp(src, 'i'))
+    this.skillLedger = new SkillLedger()
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -127,6 +135,42 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 4：技能演化哨兵（写技能文件时，盯跨版本「去约束」轨迹——SkillPoison 防御）
+    if (this.guardSkills) {
+      const skillHit = this.checkSkillEvolution(toolName, payload)
+      if (skillHit) return skillHit
+    }
+
+    return false
+  }
+
+  /**
+   * 技能演化判定：账本 = 磁盘真实状态的历史——只有放行（含批准后）的版本才入账；
+   * 同内容重写幂等跳过。返回 Interception=拦截；false=放行。
+   */
+  private checkSkillEvolution(toolName: string, payload: unknown): Interception | false {
+    const write = extractSkillWrite(payload, this.skillPatterns)
+    if (!write) return false
+    if (this.skillLedger.isDuplicate(write.pathKey, write.content)) return false
+    const profile = profileSkill(write.content)
+    const verdict = judgeSkillEvolution(profile, this.skillLedger.history(write.pathKey))
+    if (!verdict) {
+      this.skillLedger.record(write.pathKey, write.content)
+      return false
+    }
+    const snippet = write.content.slice(0, 300)
+    if (verdict.action === 'deny') {
+      this.audit({ level: 'deny', engine: 'skill', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet })
+      return { intercepted: true, reason: verdict.reason, ruleId: verdict.ruleId, action: 'deny', engine: 'skill' }
+    }
+    // block：人工复核（批准≠认可轨迹，批准的版本照常入账参与后续判定）
+    this.audit({ level: 'block', engine: 'skill', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, snippet })
+    const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason, detail: verdict.detail, snippet } as any)
+    const approved = typeof res === 'object' && res !== null && (res as any).approved === true
+    if (!approved) {
+      return { intercepted: true, reason: `${verdict.reason}（未获批准）`, ruleId: verdict.ruleId, action: 'block', engine: 'skill' }
+    }
+    this.skillLedger.record(write.pathKey, write.content)
     return false
   }
 
@@ -166,6 +210,16 @@ export class GuardianService extends Service {
 
   addRule(rule: Rule) { this.rules.push(rule) }
   listRules(): Rule[] { return [...this.rules] }
+
+  /** 技能演化账本快照：各技能路径的版本链摘要（版本数/约束轨迹/末版行为） */
+  skillLedgerSnapshot(): Array<{ path: string; versions: number; guardsTrail: number[]; lastActs: string[] }> {
+    return this.skillLedger.summary()
+  }
+
+  /** 清空（或指定路径的）技能演化账本 */
+  resetSkillLedger(pathKey?: string) {
+    this.skillLedger.reset(pathKey)
+  }
 }
 
 export namespace GuardianService {
@@ -180,6 +234,10 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用技能演化哨兵（默认 true）：写技能文件时检测跨版本去约束轨迹 */
+    guardSkills?: boolean
+    /** 额外的技能文件路径正则源（默认内置 skills/<name>/SKILL.md） */
+    skillPatterns?: string[]
   }
 }
 
