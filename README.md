@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 六大检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,6 +24,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **SKL** 技能演化哨兵 | 写技能文件时盯跨版本「去约束」轨迹：单步剪刀差（SKL-002）/ 渐进漂移（SKL-003）/ 出生即裸奔（SKL-001）——单版本全绿、毒性在差分里 | SkillPoison（arXiv:2610.07645） |
 
 外加：
 
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 30/30 通过
 ```
 
 ## 🙏 致谢 / 参考

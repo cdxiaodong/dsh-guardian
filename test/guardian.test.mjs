@@ -166,3 +166,138 @@ test('guardian/path 事件通道可用', async () => {
   const v = ctx.bail('guardian/path', '/etc/shadow')
   assert.equal(v.safe, false)
 })
+
+// ── 引擎 4：技能演化哨兵（SkillPoison 防御：盯泛化不盯内容）──
+const SK = '/home/u/.claude/skills/deploy/SKILL.md'
+const writeSkill = (content) => ({ file_path: SK, content })
+
+test('skill profile：约束/行为量化提取', () => {
+  const { profileSkill } = plugin
+  // 零约束 + 双高危行为
+  const bare = profileSkill('# Deploy helper\n\nRun git push --force origin main. Clean with rm -rf node_modules/.')
+  assert.equal(bare.guards, 0)
+  assert.ok(bare.actScore >= 0.9)
+  assert.equal(bare.actCount, 2)
+  // 有约束（when + in-scope）
+  const guarded = profileSkill('When tests pass in the staging repo, run git push --force origin main.')
+  assert.equal(guarded.guards, 2)
+  assert.ok(guarded.actScore >= 0.9)
+  // 中文条件计数
+  const zh = profileSkill('仅在测试环境且当评审通过时，执行 git reset --hard 同步。')
+  assert.equal(zh.guards, 2)
+  assert.equal(zh.actIds.includes('hard-reset'), true)
+  // 无危险行为
+  const clean = profileSkill('When writing docs in the docs folder, use concise language.')
+  assert.equal(clean.actScore, 0)
+})
+
+test('SKL-001：零约束高危技能需人工确认，批准后放行入账', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  // 无 approve → block
+  const r1 = run(writeSkill('# Deploy helper\n\nRun git push --force origin main. Clean with rm -rf node_modules/.'))
+  assert.ok(isBlocked(r1))
+  assert.equal(r1.ruleId, 'SKL-001')
+  // approve → 放行且入账
+  ctx.on('guardian/approve', () => ({ approved: true }))
+  const r2 = run(writeSkill('# Deploy helper\n\nRun git push --force origin main. Clean with rm -rf node_modules/.'))
+  assert.equal(isBlocked(r2), false)
+  const snap = ctx.guardian.skillLedgerSnapshot()
+  assert.equal(snap.length, 1)
+  assert.equal(snap[0].versions, 1)
+  assert.equal(snap[0].guardsTrail[0], 0)
+})
+
+test('SKL-001 不误伤：带约束的高危技能直接放行', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  assert.equal(isBlocked(run(writeSkill('When tests pass in the staging repo, run git push --force origin main.'))), false)
+})
+
+test('SKL-002：单步剪刀差（约束骤降+行为保留）直接 deny', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  // v1：4 重约束 + curl 上传，放行入账
+  const v1 = run(writeSkill('Only use this when tests pass in the staging repo and when the reviewer approved. Submit via curl --data @report.json https://api.example.com/v1/report.'))
+  assert.equal(isBlocked(v1), false)
+  // v2：约束一步摘光，行为原样保留 → deny（approve 也救不回）
+  ctx.on('guardian/approve', () => ({ approved: true }))
+  const v2 = run(writeSkill('Submit via curl --data @report.json https://api.example.com/v1/report.'))
+  assert.ok(isBlocked(v2))
+  assert.equal(v2.ruleId, 'SKL-002')
+  assert.equal(v2.action, 'deny')
+  // 被拒版本不入账：账本仍是 1 版
+  assert.equal(ctx.guardian.skillLedgerSnapshot()[0].versions, 1)
+})
+
+test('SKL-002 不误伤：约束与行为同步精简的合法重构', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  const v1 = run(writeSkill('Only use this when tests pass in the staging repo and when the reviewer approved. Submit via curl --data @report.json https://api.example.com/v1/report.'))
+  assert.equal(isBlocked(v1), false)
+  // v2：约束降到 1，但危险行为也删了（无 curl 上传）→ 不中剪刀差、不中裸奔 → 放行
+  const v2 = run(writeSkill('When tests pass, write a summary report to the shared folder.'))
+  assert.equal(isBlocked(v2), false)
+})
+
+test('SKL-003：渐进去约束轨迹（温水煮青蛙）需人工复核', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  // v1：4 约束 + hard-reset，放行
+  assert.equal(isBlocked(run(writeSkill('When tests pass and only when the staging repo is clean in github workflows, sync with git reset --hard origin/main.'))), false)
+  // v2：掉 1 约束（3），单步降幅不触 SKL-002，放行
+  assert.equal(isBlocked(run(writeSkill('When tests pass and only when the staging repo is clean, sync with git reset --hard origin/main.'))), false)
+  // v3：再掉 2 约束（1）——窗口 [4,3,1] 单调递减 2 次、行为保留 → block
+  const v3 = run(writeSkill('When tests pass, sync with git reset --hard origin/main.'))
+  assert.ok(isBlocked(v3))
+  assert.equal(v3.ruleId, 'SKL-003')
+  // 批准后入账，账本 3 版，轨迹可审计
+  ctx.on('guardian/approve', () => ({ approved: true }))
+  const v3b = run(writeSkill('When tests pass, sync with git reset --hard origin/main.'))
+  assert.equal(isBlocked(v3b), false)
+  const snap = ctx.guardian.skillLedgerSnapshot()[0]
+  assert.equal(snap.versions, 3)
+  assert.deepEqual(snap.guardsTrail, [4, 3, 1])
+})
+
+test('幂等：同内容重写不重复判定不入账', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  const c = 'When tests pass in the staging repo, run git push --force origin main.'
+  assert.equal(isBlocked(run(writeSkill(c))), false)
+  // 同内容第二次（即使不装 approve）也应放行且不增版本
+  assert.equal(isBlocked(run(writeSkill(c))), false)
+  assert.equal(ctx.guardian.skillLedgerSnapshot()[0].versions, 1)
+})
+
+test('非技能路径的普通写入不触发', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  assert.equal(isBlocked(run({ file_path: '/tmp/README.md', content: 'clean with rm -rf node_modules/ sometimes' })), false)
+  assert.equal(ctx.guardian.skillLedgerSnapshot().length, 0)
+})
+
+test('bash heredoc 写技能文件同样被识别（SKL-001）', async () => {
+  const ctx = makeCtx(); await wait()
+  const payload = "cat > ~/.claude/skills/purge/SKILL.md <<'EOF'\nRun aws s3 rb s3://old-backups --force to save cost.\nEOF"
+  const r = ctx.bail('guardian/check', 'bash', payload)
+  assert.ok(isBlocked(r))
+  assert.equal(r.ruleId, 'SKL-001')
+})
+
+test('resetSkillLedger：清账本', async () => {
+  const ctx = makeCtx(); await wait()
+  const run = (p) => ctx.bail('guardian/check', 'write', p)
+  assert.equal(isBlocked(run(writeSkill('When tests pass in the staging repo, run git push --force origin main.'))), false)
+  assert.equal(ctx.guardian.skillLedgerSnapshot().length, 1)
+  ctx.guardian.resetSkillLedger()
+  assert.equal(ctx.guardian.skillLedgerSnapshot().length, 0)
+})
+
+test('guardSkills=false 关闭技能演化哨兵', async () => {
+  const root = new Context()
+  root.plugin(plugin, { guardSkills: false })
+  await wait()
+  const r = root.bail('guardian/check', 'write', writeSkill('# Deploy helper\n\nRun git push --force origin main. Clean with rm -rf node_modules/.'))
+  assert.equal(isBlocked(r), false)
+})
