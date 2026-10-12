@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { EvolutionTracker, validateRuleChange, type RuleProposal, type ShadowRule, type ValidationVerdict, type EvolutionConfig } from './evolution.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { EvolutionTracker, validateRuleChange, type RuleProposal, type RuleProposalType, type ShadowRule, type ValidationVerdict, type EvolutionConfig } from './evolution.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'evolution'
   tool?: string
   ruleId?: string
   reason?: string
@@ -49,6 +51,9 @@ declare module 'cordis' {
  *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
  *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
  *  3. ssrf   —— 内网/元数据地址访问
+ *
+ * 引擎 6（evolution）—— 规则演化验证（VEPA）：守卫规则库自身，
+ * addRule 必须过三道门（结构验证 → 影子观察 → 证据感知晋升）。
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -58,6 +63,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private evolution: EvolutionTracker
+  private evolutionCfg: EvolutionConfig
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -67,6 +74,8 @@ export class GuardianService extends Service {
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
+    this.evolution = new EvolutionTracker(config.evolution)
+    this.evolutionCfg = config.evolution ?? {}
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
@@ -96,6 +105,12 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 6（VEPA 权威层）：影子观察 + 证据感知自动晋升，先于静态判定。
+    // 记账无条件原则：无论本次判定结果如何，影子规则都积累部署证据。
+    // 证据凑齐的当下晋升并生效（本次调用即被新规则判定）——晋升只发生
+    // 一次（影子条目随晋升摘除），不存在 observe→promote→apply 的循环。
+    this.autoPromote(toolName, text)
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -129,6 +144,101 @@ export class GuardianService extends Service {
 
     return false
   }
+
+  /** 影子观察 + 证据达标的自动晋升（VEPA authority layer 的本地实现） */
+  private autoPromote(toolName: string, text: string): void {
+    if (this.evolutionCfg.enabled === false) return
+    const hits = this.evolution.observe(toolName, text)
+    for (const shadow of hits) {
+      const promoted = this.evolution.promoteIfReady(shadow.shadowId)
+      if (promoted) {
+        const applied = this.applyPromotion(promoted)
+        this.audit({
+          level: promoted.type === 'remove' ? 'block' : 'allow',
+          engine: 'evolution',
+          ruleId: 'EVL-004',
+          reason: `影子规则证据达标自动晋升（applied=${applied}）：${promoted.rule?.id ?? promoted.targetId}`,
+          snippet: `hits=${shadow.hits} tools=${shadow.tools.size}`,
+        })
+      }
+    }
+  }
+
+  /**
+   * 规则进化提案（Gate 1+2）：验证 + 入影子库。
+   * 返回 ShadowRule=通过验证进入观察；ValidationVerdict(ok=false)=被拒。
+   */
+  submitRuleProposal(proposal: RuleProposal): ShadowRule | ValidationVerdict {
+    const result = this.evolution.submit(proposal, this.rules)
+    if ('ok' in result && 'code' in result) {
+      const verdict = result as ValidationVerdict
+      this.audit({
+        level: 'block',
+        engine: 'evolution',
+        ruleId: verdict.code ?? 'EVL-001',
+        reason: verdict.reason,
+        snippet: proposal.rule?.id ?? proposal.targetId ?? '',
+      })
+      return verdict
+    }
+    const shadow = result as ShadowRule
+    this.audit({
+      level: 'allow',
+      engine: 'evolution',
+      ruleId: 'EVL-000',
+      reason: `提案通过验证进入影子观察：${shadow.proposal.rule?.id ?? shadow.proposal.targetId ?? '(remove)'}`,
+      snippet: shadow.shadowId,
+    })
+    return shadow
+  }
+
+  /**
+   * 证据感知晋升（Gate 3）：达标返回提案并由宿主决定应用；
+   * remove 型提案永不被自动晋升，须 forcePromote 人工转正。
+   */
+  promoteShadowRule(shadowId: string): RuleProposal | null {
+    return this.evolution.promoteIfReady(shadowId)
+  }
+
+  /** 人工强制转正（跳过证据门槛；remove 提案的唯一通道） */
+  forcePromoteShadowRule(shadowId: string): RuleProposal | null {
+    return this.evolution.forcePromote(shadowId)
+  }
+
+  /**
+   * 应用已晋升的提案到正式规则库。
+   * 这是唯一改写 this.rules 的进化出口——所有变更都过了三道门。
+   */
+  applyPromotion(proposal: RuleProposal): boolean {
+    if (proposal.type === 'add' && proposal.rule) {
+      this.rules.push(proposal.rule)
+      return true
+    }
+    if (proposal.type === 'update' && proposal.rule && proposal.targetId) {
+      const idx = this.rules.findIndex(r => r.id === proposal.targetId)
+      if (idx >= 0) { this.rules[idx] = proposal.rule; return true }
+      return false
+    }
+    if (proposal.type === 'remove') {
+      const targetId = proposal.targetId ?? proposal.rule?.id
+      if (!targetId) return false
+      const idx = this.rules.findIndex(r => r.id === targetId)
+      if (idx >= 0) { this.rules.splice(idx, 1); return true }
+      return false
+    }
+    return false
+  }
+
+  /** 影子库快照（宿主观察 API） */
+  shadowRules(): ShadowRule[] { return this.evolution.shadowRules() }
+
+  /** 影子规则证据读数（宿主观察 API） */
+  shadowEvidence(shadowId: string): { hits: number; tools: number; ageMs: number } | null {
+    return this.evolution.evidenceOf(shadowId)
+  }
+
+  /** 影子 TTL 清理（宿主可定期调用；返回退役规则 id） */
+  sweepShadowRules(): string[] { return this.evolution.sweepExpired() }
 
   /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
   private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine']): Interception | false {
@@ -164,7 +274,21 @@ export class GuardianService extends Service {
       .filter(Boolean) as AuditEntry[]
   }
 
-  addRule(rule: Rule) { this.rules.push(rule) }
+  /**
+   * 运行时加规则（保持 main 兼容签名，但加 Gate-1 验证）。
+   * 结构/武器化检查失败时抛错——addRule 是宿主的同步可信通道，
+   * 坏规则必须立刻炸出来而不是悄悄生效。
+   * 注意：addRule 走的是"宿主显式添加"语义（等同声明式配置），不进影子
+   * 观察期——影子门槛只约束"来源不可信的进化提案"（submitRuleProposal）。
+   */
+  addRule(rule: Rule): this {
+    const verdict = validateRuleChange({ type: 'add', rule }, this.rules)
+    if (!verdict.ok) {
+      throw new Error(`[dsh-guardian] addRule 被演化验证器拒绝（${verdict.code}）：${verdict.reason}`)
+    }
+    this.rules.push(rule)
+    return this
+  }
   listRules(): Rule[] { return [...this.rules] }
 }
 
@@ -180,6 +304,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 规则演化验证（VEPA 三道门）配置 */
+    evolution?: EvolutionConfig
   }
 }
 
