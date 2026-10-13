@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { RelayTracker, type ProvenanceClass, type RelayConfig, type RelayVerdict, type TaintRecord, type ArtifactRecord } from './relay.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { RelayTracker, fnv1a64, normalizeArtifactPath, looksLikeEvidence, type ProvenanceClass, type RelayConfig, type RelayVerdict, type TaintRecord, type ArtifactRecord } from './relay.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'relay'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,10 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private relay: RelayTracker
+  private relayCfg: RelayConfig
+  /** 当前会话标识（跨会话接力判定的基线；宿主可用 setSession 切换） */
+  private session: string
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +72,9 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.relayCfg = config.relay ?? {}
+    this.relay = new RelayTracker(this.relayCfg)
+    this.session = config.session ?? 'default'
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -82,7 +91,33 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 引擎 40：跨会话接力污点通道。
+    // 宿主在把外部内容喂给 agent 前（爬虫结果/工具结果/文件读取）调
+    //   ctx.bail('guardian/ingest', text, origin, session)
+    // 文本携带的注入命中史会登记为污点；后续 persist/relay 判定靠它。
+    ctx.on('guardian/ingest' as any, (text: string, origin: ProvenanceClass, session?: string) => {
+      if (this.relayCfg.enabled === false) return false
+      return this.ingest(text, origin, session ?? this.session)
+    }, true)
   }
+
+  /** 登记外部内容来源：返回污点指纹（null=不追踪） */
+  ingest(text: string, origin: ProvenanceClass, session?: string): string | null {
+    return this.relay.ingest(text, origin, session ?? this.session)
+  }
+
+  /** 切换当前会话（跨会话判定基线） */
+  setSession(session: string) { this.session = session }
+
+  /** 污点查询（宿主调试/展示用） */
+  taintOf(text: string): TaintRecord | null { return this.relay.taintOf(text) }
+
+  /** 人工复核放行：清除工件的污点标记（RLY-002/004 的出口） */
+  revokeArtifact(artifactPath: string): boolean { return this.relay.revoke(artifactPath) }
+
+  /** 接力引擎状态快照 */
+  relaySnapshot(): { taints: number; artifacts: number } { return this.relay.snapshot() }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
   checkPathAccess(target: string) {
@@ -93,9 +128,52 @@ export class GuardianService extends Service {
     return verdict
   }
 
+  /**
+   * 引擎 40：写/读语义工具调用的接力判定。
+   * 约定 payload 结构（宿主按工具语义传）：
+   *   write 语义：{ path: string, content: string } 或 { file_path, content }
+   *   read  语义：{ path: string } 或字符串路径
+   * 其他工具（bash 等）返回 false 交给后续引擎。
+   */
+  private relayCheck(toolName: string, payload: unknown, text: string): Interception | false {
+    let artifactPath: string | undefined
+    let content: string | undefined
+    if (typeof payload === 'object' && payload !== null) {
+      const p = payload as Record<string, unknown>
+      artifactPath = typeof p.path === 'string' ? p.path : typeof p.file_path === 'string' ? p.file_path : undefined
+      content = typeof p.content === 'string' ? p.content : undefined
+    }
+    const isWriteTool = typeof content === 'string' && artifactPath !== undefined
+    const isReadTool = !isWriteTool && artifactPath !== undefined && /read|load|source|import|open/i.test(toolName)
+    if (!isWriteTool && !isReadTool) return false
+
+    let verdict: RelayVerdict
+    if (isWriteTool) {
+      verdict = this.relay.persist(this.session, content!, artifactPath!)
+    } else {
+      verdict = this.relay.relay(this.session, artifactPath!)
+    }
+    if (!verdict.intercepted) return false
+
+    // block 级走人工确认（与其他引擎一致）
+    if (verdict.action === 'block') {
+      const hit = this.handleRule(toolName, { id: verdict.ruleId!, reason: verdict.reason!, action: 'block' }, text.slice(0, 300), 'relay')
+      if (hit) return hit
+      return false
+    }
+    this.audit({ level: 'deny', engine: 'relay', tool: toolName, ruleId: verdict.ruleId!, reason: verdict.reason, snippet: text.slice(0, 300) })
+    return { intercepted: true, reason: verdict.reason!, ruleId: verdict.ruleId!, action: 'deny', engine: 'relay' }
+  }
+
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 40：跨会话接力污点（写/读语义工具调用交给 relay 判定）
+    if (this.relayCfg.enabled !== false && this.relay) {
+      const relayVerdict = this.relayCheck(toolName, payload, text)
+      if (relayVerdict) return relayVerdict
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -180,6 +258,10 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 跨会话接力污点引擎配置（默认启用） */
+    relay?: RelayConfig
+    /** 当前会话标识（跨会话判定基线，宿主可用 guardian.setSession 切换） */
+    session?: string
   }
 }
 
