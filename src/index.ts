@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { CompensationLedger, findCompensation, findSettlement, type EffectClass, type EffectEntry, type CompensationConfig, type CompensationVerdict } from './compensation.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { CompensationLedger, findCompensation, findSettlement, type EffectClass, type EffectEntry, type CompensationConfig, type CompensationVerdict } from './compensation.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'compensation'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private compLedger: CompensationLedger
+  private compCfg: CompensationConfig
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +70,8 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.compCfg = config.compensation ?? {}
+    this.compLedger = new CompensationLedger(this.compCfg)
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -82,6 +88,52 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 引擎 41：任务结算通道。宿主在任务结束/会话收尾时调用：
+    //   const v = ctx.bail('guardian/settle-task')
+    // v.intercepted === true 即存在未结算副作用残留，走人工裁决。
+    ctx.on('guardian/settle-task' as any, () => {
+      if (this.compCfg.enabled === false) return false
+      return this.settleTask()
+    }, true)
+  }
+
+  /** 引擎 41：副作用可撤销性审计（放行前）+ 记账 */
+  private compensationCheck(toolName: string, text: string): Interception | false {
+    if (this.compCfg.enabled === false) return false
+    const verdict = this.compLedger.check(toolName, text)
+    if (!verdict.intercepted) return false
+    if (verdict.action === 'block') {
+      const hit = this.handleRule(toolName, { id: verdict.ruleId!, reason: verdict.reason!, action: 'block' }, text.slice(0, 300), 'compensation')
+      if (hit) return hit
+      return false
+    }
+    this.audit({ level: 'deny', engine: 'compensation', tool: toolName, ruleId: verdict.ruleId!, reason: verdict.reason, snippet: text.slice(0, 300) })
+    return { intercepted: true, reason: verdict.reason!, ruleId: verdict.ruleId!, action: 'deny', engine: 'compensation' }
+  }
+
+  /** 引擎 41：结算后续调用（补偿兑现清账）。返回结算条数 */
+  settleCall(toolName: string, text: string): number {
+    return this.compLedger.settle(toolName, text)
+  }
+
+  /** 引擎 41：任务结束清点（存在未结算副作用 → 拦截给人工裁决） */
+  settleTask(): (CompensationVerdict & { unsettled: EffectEntry[] }) {
+    const v = this.compLedger.settleTask()
+    if (v.intercepted) {
+      this.audit({ level: 'block', engine: 'compensation', tool: 'task', ruleId: 'CMP-004', reason: v.reason })
+    }
+    return v
+  }
+
+  /** 引擎 41：人工接受任务残留（批准 = 全部未结算条目清账） */
+  acceptResidual(): number {
+    return this.compLedger.acceptResidual()
+  }
+
+  /** 引擎 41：账本快照 */
+  compensationSnapshot(): { total: number; unsettled: number; byClass: Record<string, number> } {
+    return this.compLedger.snapshot()
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -125,6 +177,17 @@ export class GuardianService extends Service {
         const hit = this.handleRule(toolName, { id: first.ruleId, reason: first.reason, action: 'block' }, snippet, 'ssrf')
         if (hit) return hit
       }
+    }
+
+    // 引擎 41：补偿账本——副作用可撤销性审计 + 记账。
+    // 放在其他引擎之后：被 deny 的调用不再记账；主库 block 且被批准放行、
+    // 或无命中的有副作用调用，进入账本并追问"后果撤得销吗"
+    // （裸不可逆副作用 → 升级 deny，即使有 approve 也不免检）。
+    {
+      const compVerdict = this.compensationCheck(toolName, text)
+      if (compVerdict) return compVerdict
+      // 放行的调用同时尝试结算（后续调用的补偿兑现动作清前面的账）
+      this.settleCall(toolName, text)
     }
 
     return false
@@ -180,6 +243,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 补偿账本引擎配置（默认启用） */
+    compensation?: CompensationConfig
   }
 }
 
