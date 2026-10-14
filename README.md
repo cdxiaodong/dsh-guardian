@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **补偿账本引擎**（`compensation.ts` / `guardian/settle-task`）：副作用可撤销性审计——放行即记账（undoable/escrow/irreversible 三类），任务结束清点未结算副作用；裸不可逆操作（无备份的持久化写）升级 deny。缝合 Cordon 语义事务 + Recourse 补偿凭证
 
 ## 🚦 三级处置
 
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 41/41 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +101,8 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [Cordon（arXiv:2606.17573）](https://arxiv.org/abs/2606.17573) — 语义事务：效应暂存、补偿元数据、提交前验证
+- [Recourse（arXiv:2609.01939）](https://arxiv.org/abs/2609.01939) — 补偿凭证：授权之外的事后结算账本
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
