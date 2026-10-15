@@ -6,6 +6,8 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scoreSignals, collectSignals } from './risk.js'
+import { DeferralLedger, graySignals, affinity, type DeferConfig, type DeferredEffect, type GraySignal, type LedgerEvent, type TraceEvidence, type DeferCategory } from './kairos.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +15,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { DeferralLedger, graySignals, affinity, type DeferConfig, type DeferredEffect, type GraySignal, type LedgerEvent, type TraceEvidence, type DeferCategory } from './kairos.js'
 
 export interface AuditEntry {
   ts: string
-  level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  level: 'allow' | 'block' | 'deny' | 'defer'
+  engine: 'rule' | 'secret' | 'ssrf' | 'kairos'
   tool?: string
   ruleId?: string
   reason?: string
@@ -28,7 +31,7 @@ export interface Interception {
   intercepted: true
   reason: string
   ruleId: string
-  action: Rule['action']
+  action: Rule['action'] | 'defer'
   engine: AuditEntry['engine']
 }
 
@@ -58,6 +61,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** Kairos 延迟判定门（默认 null = 关闭，既有行为不变） */
+  readonly kairos: DeferralLedger | null
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -68,6 +73,7 @@ export class GuardianService extends Service {
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
+    this.kairos = config.kairos?.enabled === true ? new DeferralLedger(config.kairos) : null
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
     ctx.effect(() => () => this.stream.end())
@@ -82,6 +88,14 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 任务结算通道（Kairos 事务边界）：宿主在任务成功/失败时调用
+    // 用法：ctx.bail('guardian/settle', 'commit' | 'abort') → { released, refused }
+    if (this.kairos) {
+      ctx.on('guardian/settle' as any, (outcome: 'commit' | 'abort') => {
+        return this.settleTask(outcome)
+      }, true)
+    }
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -96,6 +110,14 @@ export class GuardianService extends Service {
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
+
+    // 引擎 6（Kairos）：把本次调用作为 trace 证据喂入扣留账本。
+    // Kairos 的核心洞察：区分合法/攻击的证据出现在后续 trace 里——
+    // 每次调用（无论自身是否被拦）都可能让先前扣留的灰区效应证据过阈 → 确定性 refuse。
+    if (this.kairos) {
+      const events = this.kairos.observe(this.collectTraceEvidence(toolName, text))
+      for (const e of events) this.auditLedgerEvent(e)
+    }
 
     // 引擎 1：危险规则
     for (const rule of this.rules) {
@@ -127,7 +149,91 @@ export class GuardianService extends Service {
       }
     }
 
+    // 引擎 6（Kairos）：灰区扣留门。deny/block 级已由上述引擎裁决（含 approve 批准的——
+    // 用户批准语义优先，不重复 gating）；剩下 log 级信号正是"单点观测不可分"的灰区，
+    // 并集风险分 ≥ deferLo 时不立即放行，而是扣留（defer）待后续证据/oracle/结算裁决。
+    if (this.kairos) {
+      const signals = graySignals(this.rules, text)
+      if (signals.length && this.kairos.shouldDefer(signals)) {
+        const { effect, evicted } = this.kairos.defer(toolName, text.slice(0, 300), signals)
+        if (evicted) this.auditLedgerEvent(evicted)
+        const score = scoreSignals(signals as any).score
+        this.audit({ level: 'defer', engine: 'kairos', tool: toolName, ruleId: 'KAI-001', reason: `灰区扣留（风险分 ${score}）：${effect.reason}——证据未足，暂缓执行待裁决`, snippet: text.slice(0, 300) })
+        return { intercepted: true, reason: `灰区扣留（${effect.reason}）：单点证据不足，效应已暂缓，等待 oracle 裁决或任务结算`, ruleId: 'KAI-001', action: 'defer', engine: 'kairos' }
+      }
+    }
+
     return false
+  }
+
+  /** 从一次调用文本提取 trace 证据（全部规则的命中 + 密钥/SSRF 信号） */
+  private collectTraceEvidence(toolName: string, text: string): Array<Omit<TraceEvidence, 'ts'>> {
+    const evs: Array<Omit<TraceEvidence, 'ts'>> = []
+    for (const s of collectSignals(this.rules, text)) {
+      evs.push({ category: (s.category as DeferCategory | undefined) ?? 'destructive', weight: s.weight, detail: s.ruleId })
+    }
+    if (this.enableSecret) {
+      for (const hit of scanSecrets(text)) {
+        evs.push({ category: 'credential', weight: 0.95, detail: hit.ruleId })
+      }
+    }
+    if (this.enableSSRF) {
+      for (const hit of scanNetworkTarget(text)) {
+        evs.push({ category: 'network', weight: 0.8, detail: hit.ruleId })
+      }
+    }
+    return evs
+  }
+
+  /** 账本事件落审计 */
+  private auditLedgerEvent(e: LedgerEvent) {
+    this.audit({ level: e.level, engine: 'kairos', tool: e.tool, ruleId: e.ruleId, reason: e.reason })
+  }
+
+  /**
+   * oracle 裁决：向宿主的 'guardian/adjudicate' 监听器查询每个扣留效应的 release/refuse。
+   * 约定监听器返回 { verdicts: [{ id, verdict }] }。
+   * 无监听器（bail 返回 undefined）→ fail-safe 全部拒绝（有界权威：无人裁决不释放）。
+   */
+  adjudicate(): LedgerEvent[] {
+    if (!this.kairos) return []
+    this.sweepToAudit()
+    const pending = this.kairos.pendingEffects()
+    if (!pending.length) return []
+    const res = this.ctx.bail('guardian/adjudicate' as any, pending as any)
+    const events: LedgerEvent[] = []
+    if (res && typeof res === 'object' && Array.isArray((res as any).verdicts)) {
+      for (const v of (res as any).verdicts) {
+        if (!v || typeof v.id !== 'string') continue
+        if (v.verdict === 'release') events.push(...this.kairos.release([v.id], 'oracle 裁决'))
+        else if (v.verdict === 'refuse') events.push(...this.kairos.refuse(v.id, 'KAI-ORACLE', 'oracle 裁决：拒绝'))
+      }
+    } else {
+      events.push(...this.kairos.refuseAll('无 oracle 监听器，fail-safe 全部拒绝'))
+    }
+    for (const e of events) this.auditLedgerEvent(e)
+    return events
+  }
+
+  /** 任务结算（事务边界）：commit=释放全部剩余扣留；abort=全部拒绝 */
+  settleTask(outcome: 'commit' | 'abort'): { released: number; refused: number } {
+    if (!this.kairos) return { released: 0, refused: 0 }
+    const events = this.kairos.settle(outcome)
+    for (const e of events) this.auditLedgerEvent(e)
+    return {
+      released: events.filter((e) => e.level === 'allow').length,
+      refused: events.filter((e) => e.level === 'deny').length,
+    }
+  }
+
+  /** TTL 清点并审计 */
+  private sweepToAudit() {
+    if (!this.kairos) return
+    for (const e of this.kairos.sweep()) this.auditLedgerEvent(e)
+  }
+
+  pendingEffects(): readonly DeferredEffect[] {
+    return this.kairos ? this.kairos.pendingEffects() : []
   }
 
   /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
@@ -180,6 +286,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** Kairos 延迟判定门（默认关闭；enabled=true 后灰区效应扣留待裁决） */
+    kairos?: DeferConfig & { enabled?: boolean }
   }
 }
 
