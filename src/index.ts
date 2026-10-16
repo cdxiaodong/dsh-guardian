@@ -6,6 +6,7 @@ import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { DelegationLedger, classifyOperations, extractSinks, inferLabels, sinkCovered, purposeOverlap, type DelegationConfig, type GrantRequest, type Capability, type OperationClass, type DataLabel, type DelegationVerdict, type AuthorizeResult } from './delegation.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +14,12 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export { DelegationLedger, classifyOperations, extractSinks, inferLabels, sinkCovered, purposeOverlap, type DelegationConfig, type GrantRequest, type Capability, type OperationClass, type DataLabel, type DelegationVerdict, type AuthorizeResult } from './delegation.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'delegation'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +60,8 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  /** 授权衰减账本（默认 null = 关闭，既有行为不变） */
+  readonly delegation: DelegationLedger | null
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -68,6 +72,7 @@ export class GuardianService extends Service {
     this.allowedRoots = config.allowedRoots ?? []
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
+    this.delegation = config.delegation?.enabled === true ? new DelegationLedger(config.delegation) : null
 
     // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
     ctx.effect(() => () => this.stream.end())
@@ -82,6 +87,28 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 授权编译通道（DelegateGuard）：宿主拿到用户批准后把授权铸成五维能力
+    // 用法：ctx.bail('guardian/grant', { purpose, ... }) → { ok: true, capability }
+    if (this.delegation) {
+      ctx.on('guardian/grant' as any, (req: GrantRequest) => {
+        const capability = this.delegation!.grant(req)
+        this.audit({ level: 'allow', engine: 'delegation', tool: 'grant', ruleId: 'DLG-GRANT', reason: `授权编译：${capability.purpose.slice(0, 80)}（ops=${capability.operations.join('|')} depth=${capability.depth} uses=${capability.maxUses}）` })
+        return { ok: true as const, capability }
+      }, true)
+
+      // 委派衰减通道：子 agent / 子工具继承授权，逐维只减不增
+      // 用法：ctx.bail('guardian/delegate', parentId, req) → DelegationVerdict
+      ctx.on('guardian/delegate' as any, (parentId: string, req: GrantRequest) => {
+        const verdict = this.delegation!.delegate(parentId, req)
+        if (!verdict.ok) {
+          this.audit({ level: 'deny', engine: 'delegation', tool: 'delegate', ruleId: verdict.ruleId, reason: verdict.reason })
+        } else {
+          this.audit({ level: 'allow', engine: 'delegation', tool: 'delegate', ruleId: 'DLG-DELEGATE', reason: `合法衰减委派 ${verdict.capability.id}（父 ${parentId}，depth ${verdict.capability.depth}）` })
+        }
+        return verdict
+      }, true)
+    }
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -142,6 +169,24 @@ export class GuardianService extends Service {
       const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
       const approved = typeof res === 'object' && res !== null && (res as any).approved === true
       if (!approved) {
+        // 引擎（delegation）：本次人工未批准，但用户既往批准编译成的能力可能仍覆盖——
+        // 授权复用（reference monitor 语义：同类操作不再打扰用户）；
+        // 与已失效授权维度匹配的重放则升级 deny（DLG-002）；从未覆盖维持原拦截走人工。
+        if (this.delegation) {
+          const verdict = this.delegation.authorize({
+            operations: classifyOperations(snippet),
+            sinks: (() => { const s = extractSinks(snippet); return [...s.paths, ...s.domains] })(),
+            labels: inferLabels(snippet),
+          })
+          if (verdict.decision === 'allow') {
+            this.audit({ level: 'allow', engine: 'delegation', tool: toolName, ruleId: 'DLG-REUSE', reason: `授权复用：能力 ${verdict.capability!.id} 覆盖本次操作（剩余预算 ${verdict.capability!.maxUses - verdict.capability!.uses}）`, snippet })
+            return false
+          }
+          if (verdict.decision === 'deny') {
+            this.audit({ level: 'deny', engine: 'delegation', tool: toolName, ruleId: verdict.ruleId, reason: verdict.reason!, snippet })
+            return { intercepted: true, reason: `${rule.reason}；${verdict.reason}`, ruleId: verdict.ruleId!, action: 'deny', engine: 'delegation' }
+          }
+        }
         return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine }
       }
       return false   // 已批准 → 放行本条，继续后续引擎
@@ -180,6 +225,8 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 授权衰减引擎（DelegateGuard）：默认关闭 */
+    delegation?: DelegationConfig & { enabled?: boolean }
   }
 }
 
