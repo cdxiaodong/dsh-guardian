@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,6 +24,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **ATR** 社区规则互操作 | 直接装载 [ATR 开放标准](https://github.com/Agent-Threat-Rule/agent-threat-rules)（"Sigma for AI agents"，836+ 条语料）YAML 规则参与拦截；反向导出内置 PI/TP 规则为 ATR 格式回馈上游 | Agent-Threat-Rule/agent-threat-rules SPEC v1.0.0 |
 
 外加：
 
@@ -74,6 +75,37 @@ if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 console.log(ctx.guardian.readAudit(20))
 ```
 
+### 🔌 ATR 社区规则互操作（engine-44）
+
+装载 [ATR（Agent Threat Rules）](https://github.com/Agent-Threat-Rule/agent-threat-rules) 开放标准规则——社区 836+ 条检测语料（提示注入/工具投毒/外泄/越权操纵）即插即用：
+
+```js
+ctx.plugin(guardian, {
+  // 内联 YAML，或用 atrRulesFile 指向语料库里的规则文件
+  atrRules: `
+title: Human Approval Fatigue Exploitation
+id: ATR-2026-00118
+status: experimental
+severity: medium
+tags: { scan_target: mcp }
+detection:
+  conditions:
+    - field: content
+      operator: regex
+      value: '(?i)(?:auto[_-]?approve|skip[_-]?confirmation)'
+`,
+})
+
+// 工具调用之外的事件走独立通道（如扫描 SKILL.md / LLM I/O / 工具返回）：
+const hits = ctx.bail('guardian/atr', { type: 'skill', content: skillMd })
+// → [{ rule_id, severity, category, matched_conditions, ... }]（SPEC §7 字段）
+
+// 反向：导出内置 PI/TP 规则为 ATR YAML（厂商前缀 DSH-2026-9xxxx），可直接向语料库提 PR
+fs.writeFileSync('dsh-rules.yaml', ctx.guardian.exportAtrYaml())
+```
+
+实现的规范语义（[SPEC v1.0.0](https://github.com/Agent-Threat-Rule/agent-threat-rules/blob/main/SPEC.md)）：pattern/behavioral 双条件形态、`any`/`all`/布尔表达式（AND/OR/NOT/括号）组合器、内联 flag `(?i)` 剥离（§6.4）、未知 operator 装载期拒绝而非静默漏报（§6.3）、`scan_target` 事件路由（conformance #3）、`status: draft/deprecated` 默认不参与匹配（#4）、Match 输出含 §7 必备字段；behavioral 条件内置 `tool_calls_per_minute` 滚动窗口指标，宿主可注入自定义指标。severity→处置默认映射 critical/high/medium→block、low/informational→log（`atrSeverityAction` 可覆盖）。
+
 ## 🔧 对应论文机制
 
 | Cordis / 时空可组合概念 | 本插件体现 |
@@ -86,7 +118,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 37/37 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -99,6 +131,7 @@ npm ci && npm test     # 19/19 通过
 - [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
+- [Agent-Threat-Rule/agent-threat-rules](https://github.com/Agent-Threat-Rule/agent-threat-rules) — ATR 开放检测规则标准（engine-44 互操作层对接其 SPEC v1.0.0）
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
