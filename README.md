@@ -29,6 +29,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 
 - **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
 - **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **恢复完整性守卫**（`guardian/resume`，engine-45）：回滚免疫账本——中断/回滚后的"恢复重试"先对账再放行：效应重复落地 deny、内容偷换/依赖漂移/结果未知 block、冒领恢复 block；配套 `guardian/resume-commit` / `guardian/resume-abort` 结算通道
 
 ## 🚦 三级处置
 
@@ -86,7 +87,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 56/56 通过（含 engine-45 恢复完整性 37 条：六规则纯逻辑 + 论文场景回放 + Cordis 通道集成）
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +101,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [arXiv:2608.29381 "Safe to Resume?"](https://arxiv.org/abs/2608.29381) — 检查点/回滚的安全语义（engine-45 恢复完整性守卫）
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
