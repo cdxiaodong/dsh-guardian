@@ -2,10 +2,12 @@ import { Context, Service } from 'cordis'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
+import { createHash } from 'node:crypto'
 import { DEFAULT_RULES, type Rule } from './rules.js'
 import { scanSecrets, type SecretHit } from './secrets.js'
 import { scanNetworkTarget } from './ssrf.js'
 import { checkPath } from './path.js'
+import { scanSkillMeta, analyzeSkillChurn, CHURN_WINDOW_MS, CHURN_THRESHOLD, type SkillManifest, type SkillMetaFinding, type SkillChurnEntry } from './skillmeta.js'
 
 export const name = 'dsh-guardian'
 export { DEFAULT_RULES, type Rule }
@@ -13,11 +15,18 @@ export { scanSecrets, SECRET_RULES, shannonEntropy, type SecretHit } from './sec
 export { scanNetworkTarget, SSRF_RULES } from './ssrf.js'
 export { checkPath, SENSITIVE_PREFIXES, SENSITIVE_SUFFIXES, type PathVerdict } from './path.js'
 export { scoreSignals, collectSignals, secretEntropySignal, DEFAULT_THRESHOLDS, type RiskScore, type RiskSignal, type RiskThresholds } from './risk.js'
+export {
+  scanSkillMeta, analyzeSkillChurn, stem,
+  STUFFING_MIN_TERMS, STUFFING_MIN_UNSSUPPORTED, STUFFING_RATIO,
+  SATURATION_SIMILARITY, SATURATION_NEIGHBORS, OVERCLAIM_MIN,
+  CHURN_WINDOW_MS, CHURN_THRESHOLD,
+  type SkillManifest, type SkillMetaFinding, type SkillChurnEntry,
+} from './skillmeta.js'
 
 export interface AuditEntry {
   ts: string
   level: 'allow' | 'block' | 'deny'
-  engine: 'rule' | 'secret' | 'ssrf'
+  engine: 'rule' | 'secret' | 'ssrf' | 'skillmeta'
   tool?: string
   ruleId?: string
   reason?: string
@@ -58,6 +67,11 @@ export class GuardianService extends Service {
   private enableSSRF: boolean
   private enablePath: boolean
   private allowedRoots: string[]
+  private enableSkillMeta: boolean
+  private churnWindowMs: number
+  private churnThreshold: number
+  /** 技能版本观测历史（SMD-005 震荡分析状态），skillId → 观测序列 */
+  private churnLog = new Map<string, SkillChurnEntry[]>()
 
   constructor(ctx: Context, config: GuardianService.Config = {}) {
     super(ctx, 'guardian')
@@ -66,6 +80,9 @@ export class GuardianService extends Service {
     this.enableSSRF = config.scanSSRF ?? true
     this.enablePath = config.checkPaths ?? true
     this.allowedRoots = config.allowedRoots ?? []
+    this.enableSkillMeta = config.scanSkillMeta ?? true
+    this.churnWindowMs = config.skillChurnWindowMs ?? CHURN_WINDOW_MS
+    this.churnThreshold = config.skillChurnThreshold ?? CHURN_THRESHOLD
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
@@ -82,6 +99,12 @@ export class GuardianService extends Service {
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
+
+    // 技能元数据完整性审计通道：宿主在装载/更新技能前调用
+    // 用法：const r = ctx.bail('guardian/skill-meta', manifest, skillId?)；Interception=拦截，false=放行
+    ctx.on('guardian/skill-meta' as any, (manifest: SkillManifest, skillId?: string) => {
+      return this.checkSkillMeta(manifest, skillId)
+    }, true)
   }
 
   /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
@@ -91,6 +114,37 @@ export class GuardianService extends Service {
       this.audit({ level: 'deny', engine: 'rule', tool: 'fs', ruleId: 'PATH-SANDBOX', reason: verdict.reason, snippet: target.slice(0, 300) })
     }
     return verdict
+  }
+
+  /**
+   * 技能元数据完整性审计（engine-46）。
+   * 宿主装载/更新技能前调用；SMD-005 需要版本历史，由本服务按 skillId 维护观测记录。
+   */
+  checkSkillMeta(manifest: SkillManifest, skillId?: string): Interception | false {
+    if (!this.enableSkillMeta) return false
+    const id = skillId ?? manifest.name
+    const findings: SkillMetaFinding[] = scanSkillMeta(manifest)
+
+    // 记录本次观测并做震荡分析（代码冻结 + 元数据反复变 = 竞争反馈调参痕迹）
+    const entry: SkillChurnEntry = {
+      ts: Date.now(),
+      metaHash: sha256(canonicalJson({ name: manifest.name, description: manifest.description, tags: manifest.tags, keywords: manifest.keywords })),
+      contentHash: sha256(manifest.content),
+    }
+    const history = this.churnLog.get(id) ?? []
+    history.push(entry)
+    while (history.length > 64) history.shift()   // 单技能观测上限，防无限增长
+    this.churnLog.set(id, history)
+    while (this.churnLog.size > 1024) this.churnLog.delete(this.churnLog.keys().next().value!)   // 技能级 LRU
+    const churn = analyzeSkillChurn(history, { windowMs: this.churnWindowMs, threshold: this.churnThreshold })
+    if (churn) findings.push(churn)
+
+    for (const f of findings) {
+      const snippet = `[${id}] ${f.evidence}`.slice(0, 300)
+      const hit = this.handleRule(id, { id: f.ruleId, reason: f.reason, action: f.action }, snippet, 'skillmeta')
+      if (hit) return hit
+    }
+    return false
   }
 
   /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
@@ -180,7 +234,26 @@ export namespace GuardianService {
     checkPaths?: boolean
     /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
     allowedRoots?: string[]
+    /** 是否启用技能元数据完整性审计（默认 true） */
+    scanSkillMeta?: boolean
+    /** SMD-005 元数据震荡分析窗口（毫秒，默认 24h） */
+    skillChurnWindowMs?: number
+    /** SMD-005 触发的不同元数据版本数下限（默认 3） */
+    skillChurnThreshold?: number
   }
+}
+
+/** 键排序序列化（canonicalJson）：LLM/攻击者重排键序不影响 hash 语义 */
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v)
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
+  const obj = v as Record<string, unknown>
+  const keys = Object.keys(obj).sort()
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(',')}}`
+}
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex')
 }
 
 export const provide = ['guardian']

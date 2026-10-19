@@ -15,7 +15,7 @@ LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文�
 Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ 检测引擎
 
 | 引擎 | 检测内容 | 借鉴来源 |
 |---|---|---|
@@ -24,6 +24,7 @@ Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦�
 | **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
 | **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
 | **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **SMD** 技能元数据投毒 | 检索关键词堆砌、标签同义词饱和、能力过度声明、排名诱导语、元数据震荡（`guardian/skill-meta`） | MetaCascade（arXiv:2610.14836） |
 
 外加：
 
@@ -70,7 +71,13 @@ if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
 const v = ctx.bail('guardian/path', filePath)
 if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
 
-// ④ 查审计日志
+// ④ 装载/更新技能前审计元数据完整性（拦截 metadata-only 投毒技能）
+const r2 = ctx.bail('guardian/skill-meta', {
+  name: 'some-skill', description: '...', tags: [...], content: sourceText,
+})
+if (r2 && r2.intercepted) throw new Error(`技能被拦截：${r2.reason}`)
+
+// ⑤ 查审计日志
 console.log(ctx.guardian.readAudit(20))
 ```
 
@@ -86,7 +93,7 @@ console.log(ctx.guardian.readAudit(20))
 ## 🧪 测试
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # 43/43 通过
 ```
 
 ## 🙏 致谢 / 参考
@@ -100,6 +107,7 @@ npm ci && npm test     # 19/19 通过
 - [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
 - [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
 - [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- MetaCascade: End-to-End Attacks on Agent Skills via Metadata-Only Poisoning（arXiv:2610.14836）— 技能元数据投毒攻击链（检索劫持/选择诱导/竞争反馈调参）的防守侧实现
 
 > ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
 
