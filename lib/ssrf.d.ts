@@ -1,10 +1,10 @@
-/** SSRF / 内网目标检测：识别 Agent 试图访问的内网/元数据地址 */
+/** SSRF / internal target detection: identifies internal and metadata addresses an agent attempts to access */
 export interface SSRFRule {
     id: string;
     pattern: RegExp;
     reason: string;
 }
-/** 内网/危险目标地址（出现在 URL/IP 参数里即告警） */
+/** Internal/dangerous target addresses (raises an alert when they appear in URL/IP parameters) */
 export declare const SSRF_RULES: SSRFRule[];
 export declare function scanNetworkTarget(text: string): Array<{
     ruleId: string;

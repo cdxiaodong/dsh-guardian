@@ -1,50 +1,50 @@
 # dsh-guardian
 
-> **Agent 安全护栏** · 基于 [Cordis](https://github.com/cordiverse/cordis) 时空可组合元内核的 DeepSeek Harness 插件。
-> 在 Agent 每次工具调用前做安全审查，命中危险即拦截或要求人工确认。
+> **Agent security guardrail** · a DeepSeek Harness plugin built on the [Cordis](https://github.com/cordiverse/cordis) spatio-temporal composable meta-kernel.
+> Performs a security review before every tool call the Agent makes; if a dangerous operation is matched, it blocks it or requires manual confirmation.
 
 [![CI](https://github.com/cdxiaodong/dsh-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/cdxiaodong/dsh-guardian/actions/workflows/ci.yml)
 
 ---
 
-## 🎯 解决什么问题
+## 🎯 What problem it solves
 
-LLM Agent（Claude Code / DeepSeek Harness）能自主执行 shell、读写文件、发网络请求。一旦被**提示注入**、**工具投毒**或**模型误判**带偏，可能在你不知情时 `rm -rf`、读取 `.ssh/id_rsa`、把密钥外泄到远程。本插件是一道**运行时安全网**：
+LLM Agents (Claude Code / DeepSeek Harness) can autonomously run shell commands, read and write files, and make network requests. If they are steered by **prompt injection**, **tool poisoning**, or **model misjudgment**, they can run `rm -rf`, read `.ssh/id_rsa`, or exfiltrate keys to a remote host without your knowledge. This plugin is a **runtime safety net**:
 
 ```
-Agent 想执行工具 → guardian/check 前置审查 → 命中规则 → 拦截 / 人工批准 → 才放行
+Agent wants to run a tool → guardian/check pre-review → rule matched → block / manual approval → only then allowed
 ```
 
-## 🛡️ 五大检测引擎
+## 🛡️ Five Detection Engines
 
-| 引擎 | 检测内容 | 借鉴来源 |
+| Engine | What it detects | Inspired by |
 |---|---|---|
-| **CMD/INJ** 危险命令 | rm -rf、dd、mkfs、fork炸弹、反弹shell、管道执行、提权 | Sigma 规则、PayloadsAllTheThings |
-| **CRED** 凭据保护 | 读 .ssh/.aws/.env/kubeconfig、/etc/shadow | mcp-safeguard CRED 系列 |
-| **SECRET** 密钥泄露 | AWS/GitHub/OpenAI/Anthropic/Slack/Stripe 等 25+ 种密钥正则 + Shannon 熵过滤降误报 | gitleaks、trufflehog |
-| **SSRF** 网络目标 | 云 metadata（169.254.169.254）、内网网段、file://、gopher:// | mcp-safeguard SS 系列 |
-| **PI/TP** 提示注入+工具投毒 | ignore previous instructions、DAN越狱、零宽字符、HTML注释藏指令、瞒用户指令 | Rebuff、LLM Guard、Vigil |
+| **CMD/INJ** dangerous commands | rm -rf, dd, mkfs, fork bombs, reverse shells, pipe-to-shell execution, privilege escalation | Sigma rules, PayloadsAllTheThings |
+| **CRED** credential protection | reading .ssh/.aws/.env/kubeconfig, /etc/shadow | mcp-safeguard CRED series |
+| **SECRET** secret leakage | regexes for 25+ secret types (AWS/GitHub/OpenAI/Anthropic/Slack/Stripe, etc.) + Shannon entropy filtering to reduce false positives | gitleaks, trufflehog |
+| **SSRF** network targets | cloud metadata (169.254.169.254), internal network ranges, file://, gopher:// | mcp-safeguard SS series |
+| **PI/TP** prompt injection + tool poisoning | ignore previous instructions, DAN jailbreaks, zero-width characters, HTML comments hiding instructions, instructions to conceal from the user | Rebuff, LLM Guard, Vigil |
 
-外加：
+In addition:
 
-- **路径沙箱**（`guardian/path`）：realpath 解析 + 白名单根目录 + 编码变体解码 + 空字节截断检测——比纯正则可靠
-- **风险评分引擎**（`risk.ts`）：多信号并集概率式加权成 0~1 分，按阈值分级处置（deny/block/warn/allow）
+- **Path sandbox** (`guardian/path`): realpath resolution + allowlisted root directories + encoded-variant decoding + null-byte truncation detection — more reliable than pure regex
+- **Risk scoring engine** (`risk.ts`): multiple signals are combined via a probabilistic weighted union into a 0~1 score, which maps to a disposition by threshold (deny/block/warn/allow)
 
-## 🚦 三级处置
+## 🚦 Three Disposition Levels
 
-| 级别 | 行为 | 例子 |
+| Level | Behavior | Examples |
 |---|---|---|
-| `deny` | 直接拒绝 | 反弹shell、mkfs、读 /etc/shadow、明文密钥 |
-| `block` | 需人工确认（走 `guardian/approve`） | rm -rf ~、读 .ssh、curl 上传文件 |
-| `log` | 仅记录审计 | 路径穿越、读取 shell history |
+| `deny` | Reject outright | reverse shell, mkfs, reading /etc/shadow, plaintext secrets |
+| `block` | Requires manual confirmation (via `guardian/approve`) | rm -rf ~, reading .ssh, curl uploading a file |
+| `log` | Audit record only | path traversal, reading shell history |
 
-## 📦 安装
+## 📦 Installation
 
 ```bash
 dsh plugin --profile web add github:cdxiaodong/dsh-guardian
 ```
 
-## 🚀 用法
+## 🚀 Usage
 
 ```js
 import { Context } from 'cordis'
@@ -52,56 +52,56 @@ import * as guardian from 'dsh-guardian'
 
 const ctx = new Context()
 ctx.plugin(guardian, {
-  allowedRoots: ['/home/user/workspace'],   // 可选：文件访问沙箱白名单
-  scanSecrets: true, scanSSRF: true,        // 开关各引擎
+  allowedRoots: ['/home/user/workspace'],   // optional: file-access sandbox allowlist
+  scanSecrets: true, scanSSRF: true,        // toggle each engine
 })
 
-// ① 接入人工批准（无此监听器时 block 级默认拒绝）
+// ① Hook up manual approval (without this listener, block-level defaults to deny)
 ctx.on('guardian/approve', async ({ tool, rule, snippet }) => {
-  const ok = await confirm(`${rule.reason}：${snippet}`)  // 你的 UI 弹窗
+  const ok = await confirm(`${rule.reason}: ${snippet}`)  // your UI dialog
   return { approved: ok }
 })
 
-// ② 工具调用前审查（同步短路）
+// ② Pre-tool-call review (synchronous short-circuit)
 const r = ctx.bail('guardian/check', toolName, args)
-if (r && r.intercepted) throw new Error(`已拦截：${r.reason}`)
+if (r && r.intercepted) throw new Error(`Blocked: ${r.reason}`)
 
-// ③ 文件访问前校验路径
+// ③ Validate the path before file access
 const v = ctx.bail('guardian/path', filePath)
-if (v && v.safe === false) throw new Error(`路径被拦截：${v.reason}`)
+if (v && v.safe === false) throw new Error(`Path blocked: ${v.reason}`)
 
-// ④ 查审计日志
+// ④ Query the audit log
 console.log(ctx.guardian.readAudit(20))
 ```
 
-## 🔧 对应论文机制
+## 🔧 Corresponding Paper Mechanisms
 
-| Cordis / 时空可组合概念 | 本插件体现 |
+| Cordis / spatio-temporal composable concept | How this plugin reflects it |
 |---|---|
-| 响应式协效应（provide/inject） | `provide=['guardian']` 对外提供服务；依赖 cordis 事件系统 |
-| 可逆效应（Revertible Effects） | `ctx.effect(() => () => stream.end())` 注册撤销函数，卸载自动关文件流、零残留 |
-| 拦截机制（Intercept） | `ctx.bail('guardian/check')` 全局短路拦截，不改被保护组件代码 |
-| 隔离机制 | 多实例可绑定独立配置/白名单 |
+| Reactive co-effects (provide/inject) | `provide=['guardian']` exposes the service to others; relies on the cordis event system |
+| Revertible Effects | `ctx.effect(() => () => stream.end())` registers an undo function; on unload, file streams are closed automatically, leaving zero residue |
+| Intercept mechanism | `ctx.bail('guardian/check')` global short-circuit interception, without modifying the protected component's code |
+| Isolation mechanism | multiple instances can bind independent configurations/allowlists |
 
-## 🧪 测试
+## 🧪 Testing
 
 ```bash
-npm ci && npm test     # 19/19 通过
+npm ci && npm test     # unit + coverage tests (every rule id has positive/negative fixtures)
 ```
 
-## 🙏 致谢 / 参考
+## 🙏 Acknowledgements / References
 
-本插件的规则与架构缝合自以下优秀开源方案：
+The rules and architecture of this plugin are stitched together from the following excellent open-source projects:
 
-- [gitleaks](https://github.com/gitleaks/gitleaks) — 密钥正则库 + 熵过滤
-- [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) — 密钥检测器设计
-- [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline 架构
-- [protectai/rebuff](https://github.com/protectai/rebuff) — 四层纵深检测思想
-- [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — 提示注入签名
-- [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED 规则分类法
-- [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — 危险命令检测规则
+- [gitleaks](https://github.com/gitleaks/gitleaks) — secret regex library + entropy filtering
+- [trufflesecurity/trufflehog](https://github.com/trufflesecurity/trufflehog) — secret detector design
+- [protectai/llm-guard](https://github.com/protectai/llm-guard) — scanner pipeline architecture
+- [protectai/rebuff](https://github.com/protectai/rebuff) — the four-layer defense-in-depth detection idea
+- [deadbits/vigil-llm](https://github.com/deadbits/vigil-llm) — prompt injection signatures
+- [SyedAnas01/mcp-safeguard](https://github.com/SyedAnas01/mcp-safeguard) — TP/PI/SSRF/CRED rule taxonomy
+- [SigmaHQ/sigma](https://github.com/SigmaHQ/sigma) — dangerous command detection rules
 
-> ⚠️ **安全认知**：所有正则/启发式护栏都可能被绕过（对抗样本实测可绕过多种护栏）。本插件是 **risk reducer**，关键操作仍需**人在环确认 + 最小权限沙箱**，不能替代这两者。
+> ⚠️ **Security note**: All regex/heuristic guardrails can be bypassed (adversarial examples have been shown to bypass several guardrails). This plugin is a **risk reducer**; critical operations still require **human-in-the-loop confirmation + least-privilege sandboxing**, and it cannot replace either of these.
 
 ## 📜 License
 
