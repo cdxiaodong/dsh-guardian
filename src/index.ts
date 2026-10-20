@@ -39,16 +39,16 @@ declare module 'cordis' {
 }
 
 /**
- * Agent 安全护栏服务（cordis Service，name='guardian'）。
+ * Agent security guardrail service (cordis Service, name='guardian').
  *
- * 工作流：宿主在每次工具调用前 `ctx.bail('guardian/check', tool, payload)`。
- *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
- *  - 返回 false → 放行
+ * Workflow: the host calls `ctx.bail('guardian/check', tool, payload)` before every tool call.
+ *  - Returns an Interception object → intercept (deny rejects directly; block first goes through guardian/approve for manual confirmation)
+ *  - Returns false → allow
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
- *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ * Three detection engines:
+ *  1. rule   —— dangerous commands / destructive operations / prompt-injection regex rules
+ *  2. secret —— secret/credential leakage (gitleaks style)
+ *  3. ssrf   —— access to internal network / metadata addresses
  */
 export class GuardianService extends Service {
   private stream: fs.WriteStream
@@ -69,22 +69,22 @@ export class GuardianService extends Service {
     this.logFile = config.logFile ?? path.join(os.homedir(), '.dsh-guardian.audit.log')
     this.stream = fs.createWriteStream(this.logFile, { flags: 'a' })
 
-    // 可逆效应：插件卸载时自动关闭文件流（时空可组合-时间维度）
+    // Reversible effect: close the file stream automatically when the plugin is unloaded (space-time composability, time dimension)
     ctx.effect(() => () => this.stream.end())
 
-    // 护栏最先执行（prepend）
+    // Guardrail runs first (prepend)
     ctx.on('guardian/check' as any, (toolName: string, payload: unknown) => {
       return this.check(toolName, payload)
     }, true)
 
-    // 独立的路径沙箱校验通道：宿主读写文件前调用
-    // 用法：const v = ctx.bail('guardian/path', targetPath)；v.safe===false 即拦截
+    // Independent path sandbox validation channel: the host calls this before reading/writing files
+    // Usage: const v = ctx.bail('guardian/path', targetPath); v.safe===false means intercept
     ctx.on('guardian/path' as any, (target: string) => {
       return this.checkPathAccess(target)
     }, true)
   }
 
-  /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
+  /** Path sandbox check: realpath + allowlist, returns PathVerdict */
   checkPathAccess(target: string) {
     const verdict = checkPath(target, this.allowedRoots)
     if (!verdict.safe) {
@@ -93,11 +93,11 @@ export class GuardianService extends Service {
     return verdict
   }
 
-  /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
+  /** Core decision. Returns Interception = intercept; false = allow (cordis bail semantics) */
   check(toolName: string, payload: unknown): Interception | false {
     const text = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {})
 
-    // 引擎 1：危险规则
+    // Engine 1: dangerous rules
     for (const rule of this.rules) {
       rule.pattern.lastIndex = 0
       if (!rule.pattern.test(text)) continue
@@ -106,17 +106,17 @@ export class GuardianService extends Service {
       if (hit) return hit
     }
 
-    // 引擎 2：密钥泄露（deny 级，含明文密钥绝不放行）
+    // Engine 2: secret leakage (deny level; plaintext secrets are never allowed through)
     if (this.enableSecret) {
       const secretHits = scanSecrets(text)
       if (secretHits.length) {
         const first = secretHits[0]
-        this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `检测到明文密钥：${first.description}（${first.match}）`, snippet: text.slice(0, 300) })
-        return { intercepted: true, reason: `检测到明文密钥：${first.description}`, ruleId: first.ruleId, action: 'deny', engine: 'secret' }
+        this.audit({ level: 'deny', engine: 'secret', tool: toolName, ruleId: first.ruleId, reason: `Plaintext secret detected: ${first.description} (${first.match})`, snippet: text.slice(0, 300) })
+        return { intercepted: true, reason: `Plaintext secret detected: ${first.description}`, ruleId: first.ruleId, action: 'deny', engine: 'secret' }
       }
     }
 
-    // 引擎 3：SSRF / 内网访问（block 级，走人工确认）
+    // Engine 3: SSRF / internal network access (block level, requires manual confirmation)
     if (this.enableSSRF) {
       const ssrfHits = scanNetworkTarget(text)
       if (ssrfHits.length) {
@@ -130,7 +130,7 @@ export class GuardianService extends Service {
     return false
   }
 
-  /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
+  /** Handle a single matched rule: deny is blocked directly; block goes through manual confirmation */
   private handleRule(toolName: string, rule: { id: string; reason: string; action: Rule['action'] }, snippet: string, engine: AuditEntry['engine']): Interception | false {
     if (rule.action === 'deny') {
       this.audit({ level: 'deny', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
@@ -138,15 +138,15 @@ export class GuardianService extends Service {
     }
     if (rule.action === 'block') {
       this.audit({ level: 'block', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
-      // 宿主提供 'guardian/approve' 监听器做人工确认，约定返回 { approved: boolean }
+      // The host provides a 'guardian/approve' listener for manual confirmation; contract: returns { approved: boolean }
       const res = this.ctx.bail('guardian/approve' as any, { tool: toolName, rule, snippet } as any)
       const approved = typeof res === 'object' && res !== null && (res as any).approved === true
       if (!approved) {
-        return { intercepted: true, reason: `${rule.reason}（未获批准）`, ruleId: rule.id, action: 'block', engine }
+        return { intercepted: true, reason: `${rule.reason} (not approved)`, ruleId: rule.id, action: 'block', engine }
       }
-      return false   // 已批准 → 放行本条，继续后续引擎
+      return false   // Approved → allow this match, continue with the remaining engines
     }
-    // log：仅记录，放行
+    // log: record only, allow
     this.audit({ level: 'allow', engine, tool: toolName, ruleId: rule.id, reason: rule.reason, snippet })
     return false
   }
@@ -172,13 +172,13 @@ export namespace GuardianService {
   export interface Config {
     logFile?: string
     rules?: Rule[]
-    /** 是否启用密钥泄露扫描（默认 true） */
+    /** Whether to enable secret leakage scanning (default true) */
     scanSecrets?: boolean
-    /** 是否启用 SSRF/内网访问扫描（默认 true） */
+    /** Whether to enable SSRF/internal network access scanning (default true) */
     scanSSRF?: boolean
-    /** 是否启用路径沙箱校验（默认 true） */
+    /** Whether to enable path sandbox checks (default true) */
     checkPaths?: boolean
-    /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
+    /** Sandbox allowlist root directories (when set, paths must fall within one of them) */
     allowedRoots?: string[]
   }
 }

@@ -1,4 +1,4 @@
-/** 密钥/敏感信息泄露检测（正则借鉴 gitleaks.toml + trufflehog 检测器前缀） */
+/** Secret/sensitive data leak detection (regexes borrowed from gitleaks.toml + trufflehog detector prefixes) */
 export interface SecretRule {
     id: string;
     pattern: RegExp;
@@ -11,10 +11,10 @@ export interface SecretHit {
     secretType: string;
     description: string;
     match: string;
-    /** Shannon 熵（降误报用） */
+    /** Shannon entropy (reduces false positives) */
     entropy: number;
 }
-/** 计算字符串 Shannon 熵（trufflehog/gitleaks 用它过滤低熵误报，如 'aaaaaaaa'） */
+/** Computes the Shannon entropy of a string (trufflehog/gitleaks use it to filter low-entropy false positives, e.g. 'aaaaaaaa') */
 export declare function shannonEntropy(s: string): number;
-/** 在文本中扫描密钥，返回命中列表（含熵值，低熵命中可信度低） */
+/** Scans text for secrets and returns the hits (with entropy; low-entropy hits are less reliable) */
 export declare function scanSecrets(text: string, minEntropy?: number): SecretHit[];

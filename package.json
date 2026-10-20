@@ -1,7 +1,7 @@
 {
   "name": "dsh-guardian",
   "version": "0.1.1",
-  "description": "Agent 安全护栏：拦截并审计所有工具调用，命中敏感操作就要求人工确认",
+  "description": "Agent security guardrail: intercepts and audits all tool calls, requires manual confirmation when sensitive operations are matched",
   "type": "module",
   "main": "lib/index.js",
   "keywords": [

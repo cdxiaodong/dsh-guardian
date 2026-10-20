@@ -28,16 +28,16 @@ declare module 'cordis' {
     }
 }
 /**
- * Agent 安全护栏服务（cordis Service，name='guardian'）。
+ * Agent security guardrail service (cordis Service, name='guardian').
  *
- * 工作流：宿主在每次工具调用前 `ctx.bail('guardian/check', tool, payload)`。
- *  - 返回 Interception 对象 → 拦截（deny 直接拒；block 先走 guardian/approve 人工确认）
- *  - 返回 false → 放行
+ * Workflow: the host calls `ctx.bail('guardian/check', tool, payload)` before every tool call.
+ *  - Returns an Interception object → intercept (deny rejects directly; block first goes through guardian/approve for manual confirmation)
+ *  - Returns false → allow
  *
- * 三个检测引擎：
- *  1. rule   —— 危险命令 / 破坏操作 / 提示注入正则规则
- *  2. secret —— 密钥/凭据泄露（gitleaks 风格）
- *  3. ssrf   —— 内网/元数据地址访问
+ * Three detection engines:
+ *  1. rule   —— dangerous commands / destructive operations / prompt-injection regex rules
+ *  2. secret —— secret/credential leakage (gitleaks style)
+ *  3. ssrf   —— access to internal network / metadata addresses
  */
 export declare class GuardianService extends Service {
     private stream;
@@ -48,11 +48,11 @@ export declare class GuardianService extends Service {
     private enablePath;
     private allowedRoots;
     constructor(ctx: Context, config?: GuardianService.Config);
-    /** 路径沙箱校验：realpath + 白名单，返回 PathVerdict */
+    /** Path sandbox check: realpath + allowlist, returns PathVerdict */
     checkPathAccess(target: string): import("./path.js").PathVerdict;
-    /** 核心判定。返回 Interception=拦截；false=放行（cordis bail 语义） */
+    /** Core decision. Returns Interception = intercept; false = allow (cordis bail semantics) */
     check(toolName: string, payload: unknown): Interception | false;
-    /** 处理单条命中规则：deny 直接拦；block 走人工确认 */
+    /** Handle a single matched rule: deny is blocked directly; block goes through manual confirmation */
     private handleRule;
     audit(entry: Omit<AuditEntry, 'ts'>): void;
     readAudit(limit?: number): AuditEntry[];
@@ -63,13 +63,13 @@ export declare namespace GuardianService {
     interface Config {
         logFile?: string;
         rules?: Rule[];
-        /** 是否启用密钥泄露扫描（默认 true） */
+        /** Whether to enable secret leakage scanning (default true) */
         scanSecrets?: boolean;
-        /** 是否启用 SSRF/内网访问扫描（默认 true） */
+        /** Whether to enable SSRF/internal network access scanning (default true) */
         scanSSRF?: boolean;
-        /** 是否启用路径沙箱校验（默认 true） */
+        /** Whether to enable path sandbox checks (default true) */
         checkPaths?: boolean;
-        /** 沙箱白名单根目录（设置后，路径必须落在其中之一） */
+        /** Sandbox allowlist root directories (when set, paths must fall within one of them) */
         allowedRoots?: string[];
     }
 }

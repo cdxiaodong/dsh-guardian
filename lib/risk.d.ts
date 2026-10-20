@@ -1,7 +1,7 @@
 import type { Rule } from './rules.js';
 /**
- * 风险评分引擎（调研 takeaway：多信号加权 → 阈值分级处置）。
- * 不只会一刀切，把命中的所有信号累加成 0~1 风险分，再按阈值决定动作。
+ * Risk scoring engine (research takeaway: weighted multi-signal scoring, then threshold-based actions).
+ * Rather than blocking across the board, sums all matched signals into a 0~1 risk score, then picks an action by threshold.
  */
 export interface RiskSignal {
     ruleId: string;
@@ -10,24 +10,24 @@ export interface RiskSignal {
     category?: string;
 }
 export interface RiskScore {
-    /** 0~1 综合风险分（1 - Π(1-w)，多信号并集概率式累加，避免线性爆分） */
+    /** 0~1 combined risk score (1 - Π(1-w), probabilistic union of signals, avoids linear blow-up) */
     score: number;
     signals: RiskSignal[];
-    /** 建议处置 */
+    /** Suggested action */
     verdict: 'deny' | 'block' | 'warn' | 'allow';
 }
 export interface RiskThresholds {
-    /** ≥ 此分直接拒绝（默认 0.9） */
+    /** Score ≥ this is denied outright (default 0.9) */
     deny: number;
-    /** ≥ 此分需人工确认（默认 0.5） */
+    /** Score ≥ this requires manual confirmation (default 0.5) */
     block: number;
-    /** ≥ 此分告警记录（默认 0.25） */
+    /** Score ≥ this is logged as a warning (default 0.25) */
     warn: number;
 }
 export declare const DEFAULT_THRESHOLDS: RiskThresholds;
-/** 把命中规则集转成风险评分 */
+/** Converts the matched rule set into a risk score */
 export declare function scoreSignals(signals: RiskSignal[], thresholds?: RiskThresholds): RiskScore;
-/** 从规则列表收集一次文本命中的所有信号 */
+/** Collects all signals matched by a text from the rule list */
 export declare function collectSignals(rules: Rule[], text: string): RiskSignal[];
-/** 密钥熵越高越可疑：把熵映射成 0~1 权重信号 */
+/** Higher key entropy is more suspicious: maps entropy to a 0~1 weight signal */
 export declare function secretEntropySignal(ruleId: string, description: string, raw: string): RiskSignal;

@@ -1,5 +1,5 @@
-# cordis.patch.yml —— loader patch：把 dsh-guardian 插入 DSH 宿主插件树
-# 顶层必须是 YAML 数组（loader patch entries），`insert` 为插入的插件条目
+# cordis.patch.yml —— loader patch: inserts dsh-guardian into the DSH host plugin tree
+# Top level must be a YAML array (loader patch entries); `insert` holds the inserted plugin entries
 - insert:
     - id: dsh-guardian
       name: dsh-guardian
